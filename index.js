@@ -243,25 +243,25 @@ function matchProtectedAt(source, index) {
             const tagName = nameMatch?.[1]?.toLowerCase();
             const isClosingTag = /^<\s*\//.test(rawTag);
             const isSelfClosingTag = /\/\s*>$/.test(rawTag);
+            const isKnownHtmlTag = Boolean(tagName && standardHtmlTags.has(tagName));
+
+            // Role-play prompts often contain one-off instructions such as:
+            // <сделай что-то>, <do not translate this>, <OOC: hidden note>.
+            // These are not paired XML blocks and may contain spaces, punctuation or
+            // non-Latin characters. Protect the complete angle-bracket span locally;
+            // it must never be included in a translation unit.
+            if (settings().preserveAngleInstructions && !isKnownHtmlTag) {
+                if (tagName && !isClosingTag && !isSelfClosingTag) {
+                    const serviceBlockEnd = findServiceBlockEnd(source, tagEnd, tagName);
+                    if (serviceBlockEnd !== null) {
+                        return serviceBlockEnd;
+                    }
+                }
+                return tagEnd;
+            }
 
             if (tagName && !isClosingTag && blockedWholeTags.has(tagName)) {
                 return findClosingTag(source, tagEnd, tagName);
-            }
-
-            // SillyTavern prompts and extensions often use XML-like service blocks:
-            // <instruction>...</instruction>, <tool_call>...</tool_call>, etc.
-            // They are not HTML and their contents must not be sent to a translator.
-            // Real HTML tags remain structural only, so visible text inside div/span/button
-            // is still translated.
-            if (settings().preserveAngleInstructions
-                && tagName
-                && !isClosingTag
-                && !isSelfClosingTag
-                && !standardHtmlTags.has(tagName)) {
-                const serviceBlockEnd = findServiceBlockEnd(source, tagEnd, tagName);
-                if (serviceBlockEnd !== null) {
-                    return serviceBlockEnd;
-                }
             }
 
             return tagEnd;
@@ -296,6 +296,8 @@ function tokenizeMessage(source) {
 
 function parseTagAttributes(rawTag) {
     if (!settings().translateAttributes || /^<\s*\//.test(rawTag)) return null;
+    const tagName = rawTag.match(/^<\s*([a-zA-Z][\w:-]*)/)?.[1]?.toLowerCase();
+    if (!tagName || !standardHtmlTags.has(tagName)) return null;
     const replacements = [];
     const attrRe = /\s([:\w-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
     let match;
