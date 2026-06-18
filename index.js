@@ -176,11 +176,18 @@ function matchProtectedAt(source, index) {
     const rest = source.slice(index);
 
     if (settings().preserveCode && rest[0] === '`') {
-        // Markdown allows inline/code spans fenced by one or more backticks:
-        // `code`, ``code with ` inside``, ```code block```, etc.
-        // Protect the complete span using the same fence length as the opener.
+        // In role-play messages a single backtick pair is commonly used for
+        // inner thoughts: `this text must be translated`. Protect only each
+        // delimiter, allowing the text between them to become a normal
+        // translation segment. Two or more backticks are treated as an actual
+        // Markdown code fence and the complete fenced span stays protected.
         let fenceLength = 1;
         while (rest[fenceLength] === '`') fenceLength++;
+
+        if (fenceLength === 1) {
+            return index + 1;
+        }
+
         const fence = '`'.repeat(fenceLength);
         const end = source.indexOf(fence, index + fenceLength);
         return end < 0 ? source.length : end + fenceLength;

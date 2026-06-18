@@ -51,3 +51,9 @@
 
 ## 1.0.5
 - Защищены фрагменты в одной, двух и большем количестве обратных кавычек: `...`, ``...``, ```...```.
+
+
+## Version 1.0.6
+
+- Text inside single backticks is translated while the backticks are preserved.
+- Spans fenced with two or more backticks remain protected as code.
