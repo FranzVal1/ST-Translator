@@ -59,12 +59,31 @@
 - Spans fenced with two or more backticks remain protected as code.
 
 
-## 1.0.8
+## 1.0.9
 - Исправлена защита парных служебных блоков `<instruction>...</instruction>`.
 - Добавлена поддержка вложенных одноимённых служебных блоков.
 - Текст в одинарных обратных кавычках продолжает переводиться.
 
 
-## 1.0.8
+## 1.0.9
 - Исправлена защита одиночных инструкций вида `<сделай что-то>` без закрывающего тега.
 - Атрибуты переводятся только у известных HTML-тегов.
+
+
+## 1.0.9
+
+- Диалоговые кавычки `"..."`, `“...”`, `«...»`, `„...“` сохраняются локально.
+- Онлайн-переводчику передаётся только текст между кавычками.
+- Исправлено случайное исчезновение или замена кавычек провайдером.
+
+
+## 1.1.0 reliability update
+
+- Parser moved into a separate dependency-free module.
+- Added tests for HTML, macros, angle-bracket instructions, backticks, quotes and URLs.
+- Preserves leading/trailing whitespace and line breaks outside translation requests.
+- Supports nested `{{...}}` macros.
+- Splits long requests according to Google/Yandex/Bing limits.
+- Rejects HTML error pages returned by translation endpoints.
+- Prevents stale translation results from overwriting edited messages.
+- Prevents duplicate event handlers and cancels jobs when switching chats.
