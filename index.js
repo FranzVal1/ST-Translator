@@ -11,7 +11,7 @@ import {
 } from '../../../extensions.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 5;
+const PARSER_VERSION = 6;
 const activeJobs = new Map();
 const memoryCache = new Map();
 const sourceSnapshots = new Map();
@@ -175,13 +175,15 @@ function findClosingTag(source, from, tagName) {
 function matchProtectedAt(source, index) {
     const rest = source.slice(index);
 
-    if (settings().preserveCode && rest.startsWith('```')) {
-        const end = source.indexOf('```', index + 3);
-        return end < 0 ? source.length : end + 3;
-    }
     if (settings().preserveCode && rest[0] === '`') {
-        const end = source.indexOf('`', index + 1);
-        return end < 0 ? null : end + 1;
+        // Markdown allows inline/code spans fenced by one or more backticks:
+        // `code`, ``code with ` inside``, ```code block```, etc.
+        // Protect the complete span using the same fence length as the opener.
+        let fenceLength = 1;
+        while (rest[fenceLength] === '`') fenceLength++;
+        const fence = '`'.repeat(fenceLength);
+        const end = source.indexOf(fence, index + fenceLength);
+        return end < 0 ? source.length : end + fenceLength;
     }
     if (settings().preserveMacros && rest.startsWith('{{')) {
         const end = source.indexOf('}}', index + 2);
