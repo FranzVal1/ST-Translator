@@ -1,0 +1,14 @@
+{
+  "display_name": "Safe Translation",
+  "loading_order": 2,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "NC AI / OpenAI",
+  "version": "1.0.0",
+  "homePage": "",
+  "hooks": {
+    "activate": "init"
+  }
+}
