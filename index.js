@@ -11,7 +11,7 @@ import {
 } from '../../../extensions.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 1;
+const PARSER_VERSION = 2;
 const activeJobs = new Map();
 const memoryCache = new Map();
 
@@ -336,16 +336,31 @@ async function translateSafely(source, externalSignal) {
     return result;
 }
 
-function protectedFingerprint(plan) {
-    return plan.tokens.filter(t => t.type === 'protected').map(t => t.value);
-}
-
 function validateIntegrity(plan, result) {
-    const resultPlan = tokenizeMessage(result);
-    const before = protectedFingerprint(plan);
-    const after = resultPlan.filter(t => t.type === 'protected').map(t => t.value);
-    if (before.length !== after.length || before.some((value, index) => value !== after[index])) {
-        throw new Error('Защищённая разметка изменилась. Перевод отклонён.');
+    if (typeof result !== 'string') {
+        throw new Error('Не удалось собрать переведённое сообщение.');
+    }
+
+    // Защищённые части никогда не отправляются провайдеру и вставляются обратно
+    // непосредственно из исходного плана. Повторно токенизировать перевод нельзя:
+    // обычный переведённый текст может законно содержать <, > или {{...}}, что
+    // ранее вызывало ложное сообщение об изменённой разметке.
+    const rebuiltProtected = plan.tokens
+        .filter(token => token.type === 'protected')
+        .map(token => token.value);
+    const sourceProtected = tokenizeMessage(plan.source)
+        .filter(token => token.type === 'protected')
+        .map(token => token.value);
+
+    if (rebuiltProtected.length !== sourceProtected.length
+        || rebuiltProtected.some((value, index) => value !== sourceProtected[index])) {
+        throw new Error('Внутренняя ошибка сборки защищённой разметки.');
+    }
+
+    for (const unit of plan.units) {
+        if (typeof unit.translated !== 'string') {
+            throw new Error('Переводчик вернул неполный результат.');
+        }
     }
 }
 
