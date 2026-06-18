@@ -11,7 +11,7 @@ import {
 } from '../../../extensions.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 6;
+const PARSER_VERSION = 7;
 const activeJobs = new Map();
 const memoryCache = new Map();
 const sourceSnapshots = new Map();
@@ -172,6 +172,39 @@ function findClosingTag(source, from, tagName) {
     return match ? match.index + match[0].length : source.length;
 }
 
+function findServiceBlockEnd(source, openingEnd, tagName) {
+    let depth = 1;
+    let cursor = openingEnd;
+
+    while (cursor < source.length) {
+        const nextTagStart = source.indexOf('<', cursor);
+        if (nextTagStart < 0) return null;
+
+        const nextTagEnd = readHtmlTag(source, nextTagStart);
+        if (nextTagEnd < 0) return null;
+
+        const rawTag = source.slice(nextTagStart, nextTagEnd);
+        const match = rawTag.match(/^<\s*(\/?)\s*([a-zA-Z][\w:-]*)/);
+        const foundName = match?.[2]?.toLowerCase();
+
+        if (foundName === tagName) {
+            const closing = match[1] === '/';
+            const selfClosing = /\/\s*>$/.test(rawTag);
+
+            if (closing) {
+                depth--;
+                if (depth === 0) return nextTagEnd;
+            } else if (!selfClosing) {
+                depth++;
+            }
+        }
+
+        cursor = nextTagEnd;
+    }
+
+    return null;
+}
+
 function matchProtectedAt(source, index) {
     const rest = source.slice(index);
 
@@ -225,10 +258,9 @@ function matchProtectedAt(source, index) {
                 && !isClosingTag
                 && !isSelfClosingTag
                 && !standardHtmlTags.has(tagName)) {
-                const closingPattern = new RegExp(`<\/\s*${tagName}\s*>`, 'i');
-                const remainder = source.slice(tagEnd);
-                if (closingPattern.test(remainder)) {
-                    return findClosingTag(source, tagEnd, tagName);
+                const serviceBlockEnd = findServiceBlockEnd(source, tagEnd, tagName);
+                if (serviceBlockEnd !== null) {
+                    return serviceBlockEnd;
                 }
             }
 

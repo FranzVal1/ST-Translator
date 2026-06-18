@@ -57,3 +57,9 @@
 
 - Text inside single backticks is translated while the backticks are preserved.
 - Spans fenced with two or more backticks remain protected as code.
+
+
+## 1.0.7
+- Исправлена защита парных служебных блоков `<instruction>...</instruction>`.
+- Добавлена поддержка вложенных одноимённых служебных блоков.
+- Текст в одинарных обратных кавычках продолжает переводиться.
