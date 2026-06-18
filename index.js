@@ -11,9 +11,11 @@ import {
 } from '../../../extensions.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 2;
+const PARSER_VERSION = 5;
 const activeJobs = new Map();
 const memoryCache = new Map();
+const sourceSnapshots = new Map();
+const editCheckTimers = new Map();
 
 const defaults = Object.freeze({
     enabled: true,
@@ -28,6 +30,7 @@ const defaults = Object.freeze({
     preserveCode: true,
     preserveMacros: true,
     preserveUrls: true,
+    preserveAngleInstructions: true,
     minTextLength: 1,
     timeoutMs: 30000,
     retries: 1,
@@ -36,6 +39,19 @@ const defaults = Object.freeze({
 });
 
 const blockedWholeTags = new Set(['script', 'style', 'code', 'pre', 'textarea', 'template', 'svg', 'math']);
+const standardHtmlTags = new Set([
+    'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio', 'b', 'base', 'bdi', 'bdo',
+    'blockquote', 'body', 'br', 'button', 'canvas', 'caption', 'cite', 'col', 'colgroup',
+    'data', 'datalist', 'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt', 'em',
+    'embed', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4',
+    'h5', 'h6', 'head', 'header', 'hgroup', 'hr', 'html', 'i', 'iframe', 'img', 'input',
+    'ins', 'kbd', 'label', 'legend', 'li', 'link', 'main', 'map', 'mark', 'menu', 'meta',
+    'meter', 'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output', 'p',
+    'picture', 'portal', 'progress', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'section',
+    'select', 'slot', 'small', 'source', 'span', 'strong', 'sub', 'summary', 'sup',
+    'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'time', 'title', 'tr', 'track',
+    'u', 'ul', 'var', 'video', 'wbr',
+]);
 const visibleAttributes = new Set(['title', 'alt', 'placeholder', 'aria-label']);
 
 function settings() {
@@ -92,6 +108,7 @@ function makeSettingsHtml() {
             <option value="ja" ${s.targetLanguage === 'ja' ? 'selected' : ''}>日本語</option>
           </select>
           <label class="checkbox_label"><input id="st_safe_attrs" type="checkbox" ${s.translateAttributes ? 'checked' : ''}> Переводить видимые атрибуты title/alt/placeholder/aria-label</label>
+          <label class="checkbox_label"><input id="st_safe_angle" type="checkbox" ${s.preserveAngleInstructions ? 'checked' : ''}> Не переводить служебные блоки в &lt;...&gt;</label>
           <label class="checkbox_label"><input id="st_safe_cache" type="checkbox" ${s.cache ? 'checked' : ''}> Кешировать сегменты</label>
           <label class="checkbox_label"><input id="st_safe_debug" type="checkbox" ${s.debug ? 'checked' : ''}> Диагностический журнал</label>
           <div class="safe-translation-actions">
@@ -112,6 +129,7 @@ function bindSettings() {
     bindCheckbox('#st_safe_enabled', 'enabled');
     bindCheckbox('#st_safe_auto', 'autoIncoming');
     bindCheckbox('#st_safe_attrs', 'translateAttributes');
+    bindCheckbox('#st_safe_angle', 'preserveAngleInstructions');
     bindCheckbox('#st_safe_cache', 'cache');
     bindCheckbox('#st_safe_debug', 'debug');
     $('#st_safe_provider').on('change', function () {
@@ -181,9 +199,30 @@ function matchProtectedAt(source, index) {
             const rawTag = source.slice(index, tagEnd);
             const nameMatch = rawTag.match(/^<\s*\/?\s*([a-zA-Z][\w:-]*)/);
             const tagName = nameMatch?.[1]?.toLowerCase();
-            if (tagName && blockedWholeTags.has(tagName) && !/^<\s*\//.test(rawTag)) {
+            const isClosingTag = /^<\s*\//.test(rawTag);
+            const isSelfClosingTag = /\/\s*>$/.test(rawTag);
+
+            if (tagName && !isClosingTag && blockedWholeTags.has(tagName)) {
                 return findClosingTag(source, tagEnd, tagName);
             }
+
+            // SillyTavern prompts and extensions often use XML-like service blocks:
+            // <instruction>...</instruction>, <tool_call>...</tool_call>, etc.
+            // They are not HTML and their contents must not be sent to a translator.
+            // Real HTML tags remain structural only, so visible text inside div/span/button
+            // is still translated.
+            if (settings().preserveAngleInstructions
+                && tagName
+                && !isClosingTag
+                && !isSelfClosingTag
+                && !standardHtmlTags.has(tagName)) {
+                const closingPattern = new RegExp(`<\/\s*${tagName}\s*>`, 'i');
+                const remainder = source.slice(tagEnd);
+                if (closingPattern.test(remainder)) {
+                    return findClosingTag(source, tagEnd, tagName);
+                }
+            }
+
             return tagEnd;
         }
     }
@@ -364,6 +403,146 @@ function validateIntegrity(plan, result) {
     }
 }
 
+
+function getMessageIdFromElement(element) {
+    const messageElement = element?.closest?.('.mes');
+    if (!messageElement) return null;
+    const id = Number(messageElement.getAttribute('mesid'));
+    return Number.isInteger(id) ? id : null;
+}
+
+function isEditControl(element) {
+    if (!(element instanceof Element)) return false;
+    return Boolean(element.closest([
+        '.mes_edit',
+        '.edit_message',
+        '[data-action="edit"]',
+        '[title="Edit"]',
+        '[title="Редактировать"]',
+        '.fa-pencil',
+        '.fa-pen',
+        '.fa-edit',
+    ].join(',')));
+}
+
+function putOriginalIntoEditor(messageElement, original) {
+    const candidates = [
+        ...messageElement.querySelectorAll('textarea'),
+        ...messageElement.querySelectorAll('[contenteditable="true"]'),
+    ];
+    if (!candidates.length) return false;
+
+    let changed = false;
+    for (const editor of candidates) {
+        if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+            if (editor.value !== original) {
+                editor.value = original;
+                editor.dispatchEvent(new Event('input', { bubbles: true }));
+                changed = true;
+            }
+            continue;
+        }
+        if (editor instanceof HTMLElement) {
+            if (editor.textContent !== original) {
+                editor.textContent = original;
+                editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: null }));
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+function handleEditCapture(event) {
+    const target = event.target;
+    if (!isEditControl(target)) return;
+
+    const messageElement = target.closest('.mes');
+    const id = getMessageIdFromElement(target);
+    if (!messageElement || id === null) return;
+
+    const message = getContext().chat[id];
+    if (!message || typeof message.mes !== 'string') return;
+
+    // ST 1.18.0 may fill the editor from extra.display_text. Wait until the
+    // core click handler has created the editor, then replace only the editor
+    // value with the untouched source message. The visible translation remains
+    // stored and is not written into message.mes.
+    const applyOriginal = () => putOriginalIntoEditor(messageElement, message.mes);
+    queueMicrotask(applyOriginal);
+    requestAnimationFrame(applyOriginal);
+    setTimeout(applyOriginal, 0);
+    setTimeout(applyOriginal, 50);
+}
+
+function resolveMessageId(payload) {
+    if (Number.isInteger(Number(payload))) return Number(payload);
+    if (payload && typeof payload === 'object') {
+        for (const key of ['messageId', 'mesId', 'id', 'index']) {
+            if (Number.isInteger(Number(payload[key]))) return Number(payload[key]);
+        }
+    }
+    return null;
+}
+
+function rememberCurrentSources() {
+    const chat = getContext().chat ?? [];
+    sourceSnapshots.clear();
+    for (let id = 0; id < chat.length; id++) {
+        const message = chat[id];
+        if (message && typeof message.mes === 'string') {
+            sourceSnapshots.set(id, message.mes);
+        }
+    }
+}
+
+async function checkEditedMessage(id) {
+    const context = getContext();
+    const message = context.chat[id];
+    if (!message || message.is_system || message.is_user || typeof message.mes !== 'string') return;
+
+    const previousSource = sourceSnapshots.get(id);
+    const currentSource = message.mes;
+
+    // First observation only establishes a baseline. Changes to display_text do
+    // not affect message.mes, so our own rendering cannot trigger a translation loop.
+    if (previousSource === undefined) {
+        sourceSnapshots.set(id, currentSource);
+        return;
+    }
+    if (previousSource === currentSource) return;
+
+    sourceSnapshots.set(id, currentSource);
+    activeJobs.get(id)?.abort();
+
+    message.extra ??= {};
+    delete message.extra.display_text;
+    delete message.extra.safe_translation;
+    updateMessageBlock(id, message);
+    await context.saveChat();
+
+    if (settings().enabled && settings().autoIncoming) {
+        // Let SillyTavern finish saving and redrawing the edited message first.
+        setTimeout(() => translateMessage(id, true), 100);
+    }
+}
+
+function scheduleEditedMessageCheck(payload) {
+    const id = resolveMessageId(payload);
+    if (id === null) return;
+
+    clearTimeout(editCheckTimers.get(id));
+    const timer = setTimeout(async () => {
+        editCheckTimers.delete(id);
+        await checkEditedMessage(id);
+    }, 75);
+    editCheckTimers.set(id, timer);
+}
+
+async function handleMessageUpdated(payload) {
+    scheduleEditedMessageCheck(payload);
+}
+
 async function translateMessage(messageId, force = false) {
     const s = settings();
     if (!s.enabled) return;
@@ -374,6 +553,7 @@ async function translateMessage(messageId, force = false) {
 
     message.extra ??= {};
     const source = message.mes;
+    sourceSnapshots.set(id, source);
     const signature = `${PARSER_VERSION}|${s.provider}|${s.targetLanguage}|${source}`;
     if (!force && message.extra.safe_translation?.signature === signature && message.extra.display_text) return;
 
@@ -413,7 +593,11 @@ function setMessageBusy(id, busy) {
 }
 
 async function handleIncoming(messageId) {
-    if (settings().autoIncoming) await translateMessage(messageId, false);
+    const id = resolveMessageId(messageId);
+    if (id === null) return;
+    const message = getContext().chat[id];
+    if (message && typeof message.mes === 'string') sourceSnapshots.set(id, message.mes);
+    if (settings().autoIncoming) await translateMessage(id, false);
 }
 
 async function onMessageButtonClick(event) {
@@ -475,12 +659,21 @@ export async function init() {
     }
     $(document).off('click.safeTranslation', '.safe_translate_button')
         .on('click.safeTranslation', '.safe_translate_button', onMessageButtonClick);
+    document.removeEventListener('click', handleEditCapture, true);
+    document.addEventListener('click', handleEditCapture, true);
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleIncoming);
     eventSource.on(event_types.MESSAGE_SWIPED, handleIncoming);
-    eventSource.on(event_types.CHAT_CHANGED, () => setTimeout(() => addButtons(), 50));
+    if (event_types.MESSAGE_UPDATED) {
+        eventSource.on(event_types.MESSAGE_UPDATED, handleMessageUpdated);
+    }
+    eventSource.on(event_types.CHAT_CHANGED, () => setTimeout(() => {
+        rememberCurrentSources();
+        addButtons();
+    }, 50));
     const observer = new MutationObserver(() => addButtons());
     const chat = document.getElementById('chat');
     if (chat) observer.observe(chat, { childList: true, subtree: true });
+    rememberCurrentSources();
     addButtons();
     log('Initialized');
 }
