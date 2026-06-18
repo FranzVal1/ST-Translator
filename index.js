@@ -11,7 +11,7 @@ import {
 } from '../../../extensions.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 2;
+const PARSER_VERSION = 3;
 const activeJobs = new Map();
 const memoryCache = new Map();
 
@@ -364,6 +364,103 @@ function validateIntegrity(plan, result) {
     }
 }
 
+
+function getMessageIdFromElement(element) {
+    const messageElement = element?.closest?.('.mes');
+    if (!messageElement) return null;
+    const id = Number(messageElement.getAttribute('mesid'));
+    return Number.isInteger(id) ? id : null;
+}
+
+function isEditControl(element) {
+    if (!(element instanceof Element)) return false;
+    return Boolean(element.closest([
+        '.mes_edit',
+        '.edit_message',
+        '[data-action="edit"]',
+        '[title="Edit"]',
+        '[title="Редактировать"]',
+        '.fa-pencil',
+        '.fa-pen',
+        '.fa-edit',
+    ].join(',')));
+}
+
+function putOriginalIntoEditor(messageElement, original) {
+    const candidates = [
+        ...messageElement.querySelectorAll('textarea'),
+        ...messageElement.querySelectorAll('[contenteditable="true"]'),
+    ];
+    if (!candidates.length) return false;
+
+    let changed = false;
+    for (const editor of candidates) {
+        if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
+            if (editor.value !== original) {
+                editor.value = original;
+                editor.dispatchEvent(new Event('input', { bubbles: true }));
+                changed = true;
+            }
+            continue;
+        }
+        if (editor instanceof HTMLElement) {
+            if (editor.textContent !== original) {
+                editor.textContent = original;
+                editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: null }));
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+function handleEditCapture(event) {
+    const target = event.target;
+    if (!isEditControl(target)) return;
+
+    const messageElement = target.closest('.mes');
+    const id = getMessageIdFromElement(target);
+    if (!messageElement || id === null) return;
+
+    const message = getContext().chat[id];
+    if (!message || typeof message.mes !== 'string') return;
+
+    // ST 1.18.0 may fill the editor from extra.display_text. Wait until the
+    // core click handler has created the editor, then replace only the editor
+    // value with the untouched source message. The visible translation remains
+    // stored and is not written into message.mes.
+    const applyOriginal = () => putOriginalIntoEditor(messageElement, message.mes);
+    queueMicrotask(applyOriginal);
+    requestAnimationFrame(applyOriginal);
+    setTimeout(applyOriginal, 0);
+    setTimeout(applyOriginal, 50);
+}
+
+async function handleMessageUpdated(messageId) {
+    const id = Number(messageId);
+    if (!Number.isInteger(id)) return;
+    const context = getContext();
+    const message = context.chat[id];
+    if (!message || message.is_system || message.is_user || typeof message.mes !== 'string') return;
+
+    const saved = message.extra?.safe_translation;
+    if (!saved) return;
+
+    const currentSignature = `${PARSER_VERSION}|${settings().provider}|${settings().targetLanguage}|${message.mes}`;
+    if (saved.signature === currentSignature) return;
+
+    // The original was edited. Never keep showing a translation produced from
+    // the previous source text.
+    delete message.extra.display_text;
+    delete message.extra.safe_translation;
+    updateMessageBlock(id, message);
+    await context.saveChat();
+
+    if (settings().autoIncoming) {
+        setTimeout(() => translateMessage(id, true), 150);
+    }
+}
+
 async function translateMessage(messageId, force = false) {
     const s = settings();
     if (!s.enabled) return;
@@ -475,8 +572,13 @@ export async function init() {
     }
     $(document).off('click.safeTranslation', '.safe_translate_button')
         .on('click.safeTranslation', '.safe_translate_button', onMessageButtonClick);
+    document.removeEventListener('click', handleEditCapture, true);
+    document.addEventListener('click', handleEditCapture, true);
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleIncoming);
     eventSource.on(event_types.MESSAGE_SWIPED, handleIncoming);
+    if (event_types.MESSAGE_UPDATED) {
+        eventSource.on(event_types.MESSAGE_UPDATED, handleMessageUpdated);
+    }
     eventSource.on(event_types.CHAT_CHANGED, () => setTimeout(() => addButtons(), 50));
     const observer = new MutationObserver(() => addButtons());
     const chat = document.getElementById('chat');
