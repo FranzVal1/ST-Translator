@@ -9,13 +9,19 @@ import {
     extension_settings,
     getContext,
 } from '../../../extensions.js';
+import { buildPlan, rebuild, validateIntegrity } from './parser.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 7;
+const PARSER_VERSION = 10; // Повышено из-за изменения логики батчинга
 const activeJobs = new Map();
 const memoryCache = new Map();
 const sourceSnapshots = new Map();
 const editCheckTimers = new Map();
+let chatObserver = null;
+let initialized = false;
+
+// Уникальный разделитель для батчинга. Маловероятно, что он встретится в тексте.
+const BATCH_SEPARATOR = '\n[[ST_SEG]]\n';
 
 const defaults = Object.freeze({
     enabled: true,
@@ -38,22 +44,6 @@ const defaults = Object.freeze({
     debug: false,
 });
 
-const blockedWholeTags = new Set(['script', 'style', 'code', 'pre', 'textarea', 'template', 'svg', 'math']);
-const standardHtmlTags = new Set([
-    'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio', 'b', 'base', 'bdi', 'bdo',
-    'blockquote', 'body', 'br', 'button', 'canvas', 'caption', 'cite', 'col', 'colgroup',
-    'data', 'datalist', 'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt', 'em',
-    'embed', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4',
-    'h5', 'h6', 'head', 'header', 'hgroup', 'hr', 'html', 'i', 'iframe', 'img', 'input',
-    'ins', 'kbd', 'label', 'legend', 'li', 'link', 'main', 'map', 'mark', 'menu', 'meta',
-    'meter', 'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output', 'p',
-    'picture', 'portal', 'progress', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'section',
-    'select', 'slot', 'small', 'source', 'span', 'strong', 'sub', 'summary', 'sup',
-    'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'time', 'title', 'tr', 'track',
-    'u', 'ul', 'var', 'video', 'wbr',
-]);
-const visibleAttributes = new Set(['title', 'alt', 'placeholder', 'aria-label']);
-
 function settings() {
     if (!extension_settings[MODULE_ID] || typeof extension_settings[MODULE_ID] !== 'object') {
         extension_settings[MODULE_ID] = {};
@@ -68,15 +58,6 @@ function settings() {
 
 function log(...args) {
     if (settings().debug) console.debug('[Safe Translation]', ...args);
-}
-
-function escapeHtml(value) {
-    return String(value)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#039;');
 }
 
 function makeSettingsHtml() {
@@ -107,7 +88,7 @@ function makeSettingsHtml() {
             <option value="zh-CN" ${s.targetLanguage === 'zh-CN' ? 'selected' : ''}>中文</option>
             <option value="ja" ${s.targetLanguage === 'ja' ? 'selected' : ''}>日本語</option>
           </select>
-          <label class="checkbox_label"><input id="st_safe_attrs" type="checkbox" ${s.translateAttributes ? 'checked' : ''}> Переводить видимые атрибуты title/alt/placeholder/aria-label</label>
+          <label class="checkbox_label"><input id="st_safe_attrs" type="checkbox" ${s.translateAttributes ? 'checked' : ''}> Переводить видимые атрибуты (title, alt, placeholder, aria-label)</label>
           <label class="checkbox_label"><input id="st_safe_angle" type="checkbox" ${s.preserveAngleInstructions ? 'checked' : ''}> Не переводить служебные блоки в &lt;...&gt;</label>
           <label class="checkbox_label"><input id="st_safe_cache" type="checkbox" ${s.cache ? 'checked' : ''}> Кешировать сегменты</label>
           <label class="checkbox_label"><input id="st_safe_debug" type="checkbox" ${s.debug ? 'checked' : ''}> Диагностический журнал</label>
@@ -115,7 +96,7 @@ function makeSettingsHtml() {
             <button id="st_safe_translate_chat" class="menu_button">Перевести текущий чат</button>
             <button id="st_safe_clear_chat" class="menu_button">Убрать переводы</button>
           </div>
-          <small>HTML, макросы, код, URL и встроенные функции не отправляются переводчику.</small>
+          <small>HTML, макросы, код, URL защищены от отправки переводчику. Текст переводится батчами для сохранения контекста.</small>
         </div>
       </div>
     </div>`;
@@ -144,213 +125,39 @@ function bindSettings() {
     $('#st_safe_clear_chat').on('click', clearCurrentChatTranslations);
 }
 
-function isWhitespaceOrPunctuation(text) {
-    return !text.trim() || !/[\p{L}\p{N}]/u.test(text);
-}
-
-function readHtmlTag(source, start) {
-    let quote = null;
-    for (let i = start + 1; i < source.length; i++) {
-        const ch = source[i];
-        if (quote) {
-            if (ch === quote && source[i - 1] !== '\\') quote = null;
-            continue;
-        }
-        if (ch === '"' || ch === "'") {
-            quote = ch;
-            continue;
-        }
-        if (ch === '>') return i + 1;
-    }
-    return -1;
-}
-
-function findClosingTag(source, from, tagName) {
-    const re = new RegExp(`<\\/\\s*${tagName}\\s*>`, 'ig');
-    re.lastIndex = from;
-    const match = re.exec(source);
-    return match ? match.index + match[0].length : source.length;
-}
-
-function findServiceBlockEnd(source, openingEnd, tagName) {
-    let depth = 1;
-    let cursor = openingEnd;
-
-    while (cursor < source.length) {
-        const nextTagStart = source.indexOf('<', cursor);
-        if (nextTagStart < 0) return null;
-
-        const nextTagEnd = readHtmlTag(source, nextTagStart);
-        if (nextTagEnd < 0) return null;
-
-        const rawTag = source.slice(nextTagStart, nextTagEnd);
-        const match = rawTag.match(/^<\s*(\/?)\s*([a-zA-Z][\w:-]*)/);
-        const foundName = match?.[2]?.toLowerCase();
-
-        if (foundName === tagName) {
-            const closing = match[1] === '/';
-            const selfClosing = /\/\s*>$/.test(rawTag);
-
-            if (closing) {
-                depth--;
-                if (depth === 0) return nextTagEnd;
-            } else if (!selfClosing) {
-                depth++;
-            }
-        }
-
-        cursor = nextTagEnd;
-    }
-
-    return null;
-}
-
-function matchProtectedAt(source, index) {
-    const rest = source.slice(index);
-
-    if (settings().preserveCode && rest[0] === '`') {
-        // In role-play messages a single backtick pair is commonly used for
-        // inner thoughts: `this text must be translated`. Protect only each
-        // delimiter, allowing the text between them to become a normal
-        // translation segment. Two or more backticks are treated as an actual
-        // Markdown code fence and the complete fenced span stays protected.
-        let fenceLength = 1;
-        while (rest[fenceLength] === '`') fenceLength++;
-
-        if (fenceLength === 1) {
-            return index + 1;
-        }
-
-        const fence = '`'.repeat(fenceLength);
-        const end = source.indexOf(fence, index + fenceLength);
-        return end < 0 ? source.length : end + fenceLength;
-    }
-    if (settings().preserveMacros && rest.startsWith('{{')) {
-        const end = source.indexOf('}}', index + 2);
-        return end < 0 ? null : end + 2;
-    }
-    if (settings().preserveUrls) {
-        const url = rest.match(/^(?:https?:\/\/|data:|mailto:)[^\s<>()]+/i);
-        if (url) return index + url[0].length;
-        const markdownImage = rest.match(/^!\[[^\]]*]\([^)]*\)/);
-        if (markdownImage) return index + markdownImage[0].length;
-    }
-    if (rest[0] === '<') {
-        const tagEnd = readHtmlTag(source, index);
-        if (tagEnd > 0) {
-            const rawTag = source.slice(index, tagEnd);
-            const nameMatch = rawTag.match(/^<\s*\/?\s*([a-zA-Z][\w:-]*)/);
-            const tagName = nameMatch?.[1]?.toLowerCase();
-            const isClosingTag = /^<\s*\//.test(rawTag);
-            const isSelfClosingTag = /\/\s*>$/.test(rawTag);
-            const isKnownHtmlTag = Boolean(tagName && standardHtmlTags.has(tagName));
-
-            // Role-play prompts often contain one-off instructions such as:
-            // <сделай что-то>, <do not translate this>, <OOC: hidden note>.
-            // These are not paired XML blocks and may contain spaces, punctuation or
-            // non-Latin characters. Protect the complete angle-bracket span locally;
-            // it must never be included in a translation unit.
-            if (settings().preserveAngleInstructions && !isKnownHtmlTag) {
-                if (tagName && !isClosingTag && !isSelfClosingTag) {
-                    const serviceBlockEnd = findServiceBlockEnd(source, tagEnd, tagName);
-                    if (serviceBlockEnd !== null) {
-                        return serviceBlockEnd;
-                    }
-                }
-                return tagEnd;
-            }
-
-            if (tagName && !isClosingTag && blockedWholeTags.has(tagName)) {
-                return findClosingTag(source, tagEnd, tagName);
-            }
-
-            return tagEnd;
-        }
-    }
-    return null;
-}
-
-function tokenizeMessage(source) {
-    const tokens = [];
-    let textStart = 0;
-    let i = 0;
-
-    const pushText = (end) => {
-        if (end > textStart) tokens.push({ type: 'text', value: source.slice(textStart, end) });
+function parserOptions() {
+    const s = settings();
+    return {
+        preserveCode: s.preserveCode,
+        preserveMacros: s.preserveMacros,
+        preserveUrls: s.preserveUrls,
+        preserveAngleInstructions: s.preserveAngleInstructions,
+        translateAttributes: s.translateAttributes,
+        translateTitle: s.translateTitle,
+        translateAlt: s.translateAlt,
+        translatePlaceholder: s.translatePlaceholder,
+        translateAriaLabel: s.translateAriaLabel,
+        minTextLength: s.minTextLength,
     };
-
-    while (i < source.length) {
-        const protectedEnd = matchProtectedAt(source, i);
-        if (protectedEnd !== null) {
-            pushText(i);
-            tokens.push({ type: 'protected', value: source.slice(i, protectedEnd) });
-            i = protectedEnd;
-            textStart = i;
-            continue;
-        }
-        i++;
-    }
-    pushText(source.length);
-    return tokens;
 }
 
-function parseTagAttributes(rawTag) {
-    if (!settings().translateAttributes || /^<\s*\//.test(rawTag)) return null;
-    const tagName = rawTag.match(/^<\s*([a-zA-Z][\w:-]*)/)?.[1]?.toLowerCase();
-    if (!tagName || !standardHtmlTags.has(tagName)) return null;
-    const replacements = [];
-    const attrRe = /\s([:\w-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
-    let match;
-    while ((match = attrRe.exec(rawTag))) {
-        const name = match[1].toLowerCase();
-        if (!visibleAttributes.has(name)) continue;
-        const value = match[3] ?? match[4] ?? '';
-        if (!value || isWhitespaceOrPunctuation(value)) continue;
-        const quote = match[2][0];
-        const valueOffset = match.index + match[0].indexOf(quote) + 1;
-        replacements.push({ start: valueOffset, end: valueOffset + value.length, value });
-    }
-    return replacements.length ? replacements : null;
-}
+const providerChunkLimits = Object.freeze({ google: 5000, yandex: 5000, bing: 1000 });
 
-function buildPlan(source) {
-    const base = tokenizeMessage(source);
-    const units = [];
-    for (const token of base) {
-        if (token.type === 'text') {
-            if (!isWhitespaceOrPunctuation(token.value) && token.value.trim().length >= settings().minTextLength) {
-                units.push({ kind: 'text', original: token.value, translated: null });
-                token.unit = units.length - 1;
-            }
-            continue;
-        }
-        if (token.value.startsWith('<')) {
-            const attrs = parseTagAttributes(token.value);
-            if (attrs) {
-                for (const attr of attrs) {
-                    units.push({ kind: 'attribute', original: attr.value, translated: null });
-                    attr.unit = units.length - 1;
-                }
-                token.attributes = attrs;
-            }
-        }
+function splitForProvider(text, maxLength) {
+    if (text.length <= maxLength) return [text];
+    const chunks = [];
+    let rest = text;
+    while (rest.length > maxLength) {
+        let cut = rest.lastIndexOf('\n', maxLength);
+        if (cut < Math.floor(maxLength * 0.5)) cut = rest.lastIndexOf(' ', maxLength);
+        // Fallback: если пробелов нет вообще, режем принудительно, чтобы не зависнуть в цикле
+        if (cut < Math.floor(maxLength * 0.5)) cut = maxLength; 
+        else cut += 1;
+        chunks.push(rest.slice(0, cut));
+        rest = rest.slice(cut);
     }
-    return { source, tokens: base, units };
-}
-
-function rebuild(plan) {
-    return plan.tokens.map((token) => {
-        if (token.type === 'text') {
-            return Number.isInteger(token.unit) ? plan.units[token.unit].translated : token.value;
-        }
-        if (!token.attributes) return token.value;
-        let result = token.value;
-        for (const attr of [...token.attributes].reverse()) {
-            const translated = plan.units[attr.unit].translated;
-            result = result.slice(0, attr.start) + translated + result.slice(attr.end);
-        }
-        return result;
-    }).join('');
+    if (rest) chunks.push(rest);
+    return chunks;
 }
 
 async function providerRequest(text, language, provider, signal) {
@@ -358,16 +165,10 @@ async function providerRequest(text, language, provider, signal) {
     let body;
     switch (provider) {
         case 'google':
-            url = '/api/translate/google';
-            body = { text, lang: language };
-            break;
         case 'bing':
-            url = '/api/translate/bing';
+        case 'yandex': // Единый формат payload для штатных роутов ST
+            url = `/api/translate/${provider}`;
             body = { text, lang: language };
-            break;
-        case 'yandex':
-            url = '/api/translate/yandex';
-            body = { chunks: [text], lang: language };
             break;
         default:
             throw new Error(`Неизвестный переводчик: ${provider}`);
@@ -378,8 +179,21 @@ async function providerRequest(text, language, provider, signal) {
         body: JSON.stringify(body),
         signal,
     });
-    if (!response.ok) throw new Error(`${provider}: HTTP ${response.status} ${response.statusText}`);
-    return await response.text();
+    if (!response.ok) {
+        let errorText = `HTTP ${response.status}`;
+        try {
+            const errData = await response.json();
+            errorText = errData.error || errorText;
+        } catch (e) {
+            errorText = (await response.text().catch(() => '')).slice(0, 200) || errorText;
+        }
+        throw new Error(`${provider}: ${errorText}`);
+    }
+    const result = await response.text();
+    if (!result || /^<!doctype html/i.test(result.trim()) || /^<html/i.test(result.trim())) {
+        throw new Error(`${provider}: сервер вернул некорректный ответ (HTML)`);
+    }
+    return result;
 }
 
 function cacheKey(text, language, provider) {
@@ -391,61 +205,72 @@ async function translateSegment(text, signal) {
     const key = cacheKey(text, s.targetLanguage, s.provider);
     if (s.cache && memoryCache.has(key)) return memoryCache.get(key);
 
-    let lastError;
-    for (let attempt = 0; attempt <= s.retries; attempt++) {
-        try {
-            const translated = await providerRequest(text, s.targetLanguage, s.provider, signal);
-            if (typeof translated !== 'string' || !translated.length) throw new Error('Пустой ответ переводчика');
-            if (s.cache) memoryCache.set(key, translated);
-            return translated;
-        } catch (error) {
-            lastError = error;
-            if (signal.aborted) throw error;
-            if (attempt < s.retries) await new Promise(resolve => setTimeout(resolve, 400 * (attempt + 1)));
+    const limit = providerChunkLimits[s.provider] ?? 1000;
+    const chunks = splitForProvider(text, limit);
+    let output = '';
+    for (const chunk of chunks) {
+        let lastError;
+        let translated = null;
+        for (let attempt = 0; attempt <= s.retries; attempt++) {
+            try {
+                translated = await providerRequest(chunk, s.targetLanguage, s.provider, signal);
+                break;
+            } catch (error) {
+                lastError = error;
+                if (signal.aborted) throw error;
+                if (attempt < s.retries) await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+            }
         }
+        if (translated === null) throw lastError;
+        output += translated;
     }
-    throw lastError;
+    if (s.cache) memoryCache.set(key, output);
+    return output;
 }
 
 async function translateSafely(source, externalSignal) {
-    const plan = buildPlan(source);
+    const plan = buildPlan(source, parserOptions());
     if (!plan.units.length) return source;
-    for (const unit of plan.units) {
-        unit.translated = await translateSegment(unit.original, externalSignal);
+
+    const textUnits = plan.units.filter(u => u.kind === 'text' && u.translated === null);
+    const attrUnits = plan.units.filter(u => u.kind === 'attribute' && u.translated === null);
+
+    async function translateBatch(units) {
+        if (!units.length) return;
+        const combined = units.map(u => u.original).join(BATCH_SEPARATOR);
+        const limit = providerChunkLimits[settings().provider] ?? 1000;
+        const chunks = splitForProvider(combined, limit);
+        
+        let translatedCombined = '';
+        for (const chunk of chunks) {
+            if (externalSignal.aborted) throw externalSignal.reason ?? new DOMException('Aborted', 'AbortError');
+            translatedCombined += await translateSegment(chunk, externalSignal);
+        }
+
+        // Переводчик может добавить пробелы вокруг разделителя
+        const translatedParts = translatedCombined.split(/\n?\[\[ST_SEG\]\]\n?/);
+        
+        if (translatedParts.length === units.length) {
+            units.forEach((unit, index) => {
+                unit.translated = translatedParts[index];
+            });
+        } else {
+            // Fallback: если переводчик "съел" разделители, переводим по одному
+            console.warn('[Safe Translation] Batch split failed. Falling back to sequential.');
+            for (const unit of units) {
+                if (externalSignal.aborted) throw externalSignal.reason ?? new DOMException('Aborted', 'AbortError');
+                unit.translated = await translateSegment(unit.original, externalSignal);
+            }
+        }
     }
+
+    await translateBatch(textUnits);
+    await translateBatch(attrUnits);
+
     const result = rebuild(plan);
     validateIntegrity(plan, result);
     return result;
 }
-
-function validateIntegrity(plan, result) {
-    if (typeof result !== 'string') {
-        throw new Error('Не удалось собрать переведённое сообщение.');
-    }
-
-    // Защищённые части никогда не отправляются провайдеру и вставляются обратно
-    // непосредственно из исходного плана. Повторно токенизировать перевод нельзя:
-    // обычный переведённый текст может законно содержать <, > или {{...}}, что
-    // ранее вызывало ложное сообщение об изменённой разметке.
-    const rebuiltProtected = plan.tokens
-        .filter(token => token.type === 'protected')
-        .map(token => token.value);
-    const sourceProtected = tokenizeMessage(plan.source)
-        .filter(token => token.type === 'protected')
-        .map(token => token.value);
-
-    if (rebuiltProtected.length !== sourceProtected.length
-        || rebuiltProtected.some((value, index) => value !== sourceProtected[index])) {
-        throw new Error('Внутренняя ошибка сборки защищённой разметки.');
-    }
-
-    for (const unit of plan.units) {
-        if (typeof unit.translated !== 'string') {
-            throw new Error('Переводчик вернул неполный результат.');
-        }
-    }
-}
-
 
 function getMessageIdFromElement(element) {
     const messageElement = element?.closest?.('.mes');
@@ -507,15 +332,18 @@ function handleEditCapture(event) {
     const message = getContext().chat[id];
     if (!message || typeof message.mes !== 'string') return;
 
-    // ST 1.18.0 may fill the editor from extra.display_text. Wait until the
-    // core click handler has created the editor, then replace only the editor
-    // value with the untouched source message. The visible translation remains
-    // stored and is not written into message.mes.
-    const applyOriginal = () => putOriginalIntoEditor(messageElement, message.mes);
-    queueMicrotask(applyOriginal);
-    requestAnimationFrame(applyOriginal);
-    setTimeout(applyOriginal, 0);
-    setTimeout(applyOriginal, 50);
+    // Наблюдатель за появлением textarea внутри конкретного сообщения
+    const observer = new MutationObserver((mutations, obs) => {
+        const textarea = messageElement.querySelector('textarea.edit_textarea, [contenteditable="true"]');
+        if (textarea) {
+            putOriginalIntoEditor(messageElement, message.mes);
+            obs.disconnect();
+        }
+    });
+
+    observer.observe(messageElement, { childList: true, subtree: true, attributes: true });
+    putOriginalIntoEditor(messageElement, message.mes);
+    setTimeout(() => observer.disconnect(), 2000);
 }
 
 function resolveMessageId(payload) {
@@ -547,8 +375,6 @@ async function checkEditedMessage(id) {
     const previousSource = sourceSnapshots.get(id);
     const currentSource = message.mes;
 
-    // First observation only establishes a baseline. Changes to display_text do
-    // not affect message.mes, so our own rendering cannot trigger a translation loop.
     if (previousSource === undefined) {
         sourceSnapshots.set(id, currentSource);
         return;
@@ -565,7 +391,6 @@ async function checkEditedMessage(id) {
     await context.saveChat();
 
     if (settings().enabled && settings().autoIncoming) {
-        // Let SillyTavern finish saving and redrawing the edited message first.
         setTimeout(() => translateMessage(id, true), 100);
     }
 }
@@ -603,23 +428,35 @@ async function translateMessage(messageId, force = false) {
     activeJobs.get(id)?.abort();
     const controller = new AbortController();
     activeJobs.set(id, controller);
-    const timeout = setTimeout(() => controller.abort(new Error('Тайм-аут перевода')), s.timeoutMs);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, s.timeoutMs);
     setMessageBusy(id, true);
     try {
         const translated = await translateSafely(source, controller.signal);
         if (activeJobs.get(id) !== controller) return;
-        message.extra.safe_translation = {
+
+        const liveContext = getContext();
+        const liveMessage = liveContext.chat[id];
+        if (!liveMessage || liveMessage.mes !== source || liveMessage.is_user || liveMessage.is_system) return;
+        liveMessage.extra ??= {};
+        liveMessage.extra.safe_translation = {
             version: 1,
             signature,
             provider: s.provider,
             targetLanguage: s.targetLanguage,
             translatedAt: Date.now(),
         };
-        message.extra.display_text = translated;
-        updateMessageBlock(id, message);
-        await context.saveChat();
+        liveMessage.extra.display_text = translated;
+        updateMessageBlock(id, liveMessage);
+        await liveContext.saveChat();
     } catch (error) {
-        if (!controller.signal.aborted || String(error).includes('Тайм-аут')) {
+        if (timedOut) {
+            console.error('[Safe Translation] Timeout', error);
+            toastr.error('Истекло время ожидания перевода.', 'Safe Translation');
+        } else if (!controller.signal.aborted) {
             console.error('[Safe Translation]', error);
             toastr.error(error instanceof Error ? error.message : String(error), 'Safe Translation');
         }
@@ -682,6 +519,8 @@ async function translateCurrentChat() {
 }
 
 async function clearCurrentChatTranslations() {
+    for (const controller of activeJobs.values()) controller.abort();
+    activeJobs.clear();
     const context = getContext();
     for (const message of context.chat) {
         if (!message.extra) continue;
@@ -694,7 +533,20 @@ async function clearCurrentChatTranslations() {
     }
 }
 
+function handleChatChanged() {
+    for (const controller of activeJobs.values()) controller.abort();
+    activeJobs.clear();
+    for (const timer of editCheckTimers.values()) clearTimeout(timer);
+    editCheckTimers.clear();
+    setTimeout(() => {
+        rememberCurrentSources();
+        addButtons();
+    }, 50);
+}
+
 export async function init() {
+    if (initialized) return;
+    initialized = true;
     settings();
     if (!document.getElementById('safe_translation_settings')) {
         $('#extensions_settings2').append(makeSettingsHtml());
@@ -704,18 +556,22 @@ export async function init() {
         .on('click.safeTranslation', '.safe_translate_button', onMessageButtonClick);
     document.removeEventListener('click', handleEditCapture, true);
     document.addEventListener('click', handleEditCapture, true);
+
+    eventSource.off?.(event_types.CHARACTER_MESSAGE_RENDERED, handleIncoming);
+    eventSource.off?.(event_types.MESSAGE_SWIPED, handleIncoming);
+    eventSource.off?.(event_types.CHAT_CHANGED, handleChatChanged);
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleIncoming);
     eventSource.on(event_types.MESSAGE_SWIPED, handleIncoming);
+    eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
     if (event_types.MESSAGE_UPDATED) {
+        eventSource.off?.(event_types.MESSAGE_UPDATED, handleMessageUpdated);
         eventSource.on(event_types.MESSAGE_UPDATED, handleMessageUpdated);
     }
-    eventSource.on(event_types.CHAT_CHANGED, () => setTimeout(() => {
-        rememberCurrentSources();
-        addButtons();
-    }, 50));
-    const observer = new MutationObserver(() => addButtons());
+
+    chatObserver?.disconnect();
+    chatObserver = new MutationObserver(() => addButtons());
     const chat = document.getElementById('chat');
-    if (chat) observer.observe(chat, { childList: true, subtree: true });
+    if (chat) chatObserver.observe(chat, { childList: true, subtree: true });
     rememberCurrentSources();
     addButtons();
     log('Initialized');
