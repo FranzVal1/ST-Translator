@@ -166,9 +166,13 @@ async function providerRequest(text, language, provider, signal) {
     switch (provider) {
         case 'google':
         case 'bing':
-        case 'yandex': // Единый формат payload для штатных роутов ST
             url = `/api/translate/${provider}`;
             body = { text, lang: language };
+            break;
+        // Возвращаем оригинальный формат payload для Yandex
+        case 'yandex':
+            url = '/api/translate/yandex';
+            body = { chunks: [text], lang: language };
             break;
         default:
             throw new Error(`Неизвестный переводчик: ${provider}`);
@@ -183,7 +187,7 @@ async function providerRequest(text, language, provider, signal) {
         let errorText = `HTTP ${response.status}`;
         try {
             const errData = await response.json();
-            errorText = errData.error || errorText;
+            errorText = errData.error || errData.message || JSON.stringify(errData);
         } catch (e) {
             errorText = (await response.text().catch(() => '')).slice(0, 200) || errorText;
         }
