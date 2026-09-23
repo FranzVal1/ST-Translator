@@ -13,6 +13,19 @@ const standardHtmlTags = new Set([
     'u', 'ul', 'var', 'video', 'wbr',
 ]);
 const visibleAttributes = new Set(['title', 'alt', 'placeholder', 'aria-label']);
+const voidTags = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+function tagAttributes(tag) {
+    return [...tag.matchAll(/\s([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)]
+        .map(m => [m[1].toLowerCase(), m[2] ?? m[3] ?? m[4] ?? '']);
+}
+function isOpaque(tag, name, options) {
+    if (blockedWholeTags.has(name) || (options.protectedTags ?? []).includes(name)) return true;
+    const attrs = new Map(tagAttributes(tag));
+    if (attrs.has('hidden')) return true;
+    const style = (attrs.get('style') ?? '').replace(/\/\*[\s\S]*?\*\//g, '');
+    if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|content-visibility\s*:\s*hidden)\s*(?:!important\s*)?(?:;|$)/i.test(style)) return true;
+    return (attrs.get('class') ?? '').split(/\s+/).some(c => (options.protectedClasses ?? []).includes(c));
+}
 
 function isWhitespaceOrPunctuation(text) {
     return !text.trim() || !/[\p{L}\p{N}]/u.test(text);
@@ -99,6 +112,12 @@ function findBalancedMacroEnd(source, start) {
 
 function matchProtectedAt(source, index, options) {
     const rest = source.slice(index);
+    const entity = rest.match(/^&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]+);/i);
+    if (entity) return index + entity[0].length;
+    if (rest.startsWith('<!--')) {
+        const end = source.indexOf('-->', index + 4);
+        return end < 0 ? source.length : end + 3;
+    }
 
     // Dialogue quotation marks are local formatting delimiters. Protect only
     // the mark itself; text between marks remains translatable.
@@ -133,6 +152,11 @@ function matchProtectedAt(source, index, options) {
             const isClosingTag = /^<\s*\//.test(rawTag);
             const isSelfClosingTag = /\/\s*>$/.test(rawTag);
             const isKnownHtmlTag = Boolean(tagName && standardHtmlTags.has(tagName));
+
+            if (tagName && !isClosingTag && isOpaque(rawTag, tagName, options)) {
+                if (isSelfClosingTag || voidTags.has(tagName)) return tagEnd;
+                return findServiceBlockEnd(source, tagEnd, tagName) ?? source.length;
+            }
 
             // Any non-HTML <...> span is an instruction and remains byte-for-byte intact.
             if (options.preserveAngleInstructions && !isKnownHtmlTag) {
@@ -177,7 +201,8 @@ function tokenizeMessage(source, options) {
 function parseTagAttributes(rawTag, options) {
     if (!options.translateAttributes || /^<\s*\//.test(rawTag)) return null;
     const tagName = rawTag.match(/^<\s*([a-zA-Z][\w:-]*)/)?.[1]?.toLowerCase();
-    if (!tagName || !standardHtmlTags.has(tagName)) return null;
+    if (!tagName || !standardHtmlTags.has(tagName) || isOpaque(rawTag, tagName, options)) return null;
+    if (readHtmlTag(rawTag, 0) !== rawTag.length) return null;
     const replacements = [];
     const attrRe = /\s([:\w-]+)\s*=\s*("([^"]*)"|'([^']*)')/g;
     let match;
@@ -223,8 +248,11 @@ export function buildPlan(source, options) {
             const attrs = parseTagAttributes(token.value, options);
             if (attrs) {
                 for (const attr of attrs) {
-                    units.push({ kind: 'attribute', original: attr.value, translated: null });
-                    attr.unit = units.length - 1;
+                    attr.plan = buildPlan(attr.value, { ...options, translateAttributes: false });
+                    for (const unit of attr.plan.units) {
+                        unit.kind = 'attribute';
+                        units.push(unit);
+                    }
                 }
                 token.attributes = attrs;
             }
@@ -233,17 +261,25 @@ export function buildPlan(source, options) {
     return { source, tokens, units };
 }
 
-export function rebuild(plan) {
+function escapeTranslation(text, attribute = false) {
+    if (typeof text !== 'string' || !text.trim()) throw new Error('Переводчик вернул неполный результат.');
+    // Provider output is text, never executable markup or a new ST macro.
+    if (text.includes('{{') || text.includes('}}')) throw new Error('Переводчик добавил служебный макрос.');
+    const escaped = text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    return attribute ? escaped.replaceAll('"', '&quot;').replaceAll("'", '&#39;') : escaped;
+}
+
+export function rebuild(plan, attribute = false) {
     return plan.tokens.map((token) => {
         if (token.type === 'text') {
             if (!Number.isInteger(token.unit)) return token.value;
-            const translated = plan.units[token.unit].translated;
+            const translated = escapeTranslation(plan.units[token.unit].translated, attribute);
             return `${token.leading ?? ''}${translated}${token.trailing ?? ''}`;
         }
         if (!token.attributes) return token.value;
         let result = token.value;
         for (const attr of [...token.attributes].reverse()) {
-            const translated = plan.units[attr.unit].translated;
+            const translated = rebuild(attr.plan, true);
             result = result.slice(0, attr.start) + translated + result.slice(attr.end);
         }
         return result;
@@ -252,10 +288,7 @@ export function rebuild(plan) {
 
 export function validateIntegrity(plan, result) {
     if (typeof result !== 'string') throw new Error('Не удалось собрать переведённое сообщение.');
-    const expectedProtected = plan.tokens.filter(t => t.type === 'protected').map(t => t.value);
-    for (const value of expectedProtected) {
-        if (!result.includes(value)) throw new Error('Защищённая разметка потеряна при сборке.');
-    }
+    if (result !== rebuild(plan)) throw new Error('Защищённая разметка потеряна при сборке.');
     for (const unit of plan.units) {
         if (typeof unit.translated !== 'string') throw new Error('Переводчик вернул неполный результат.');
     }
