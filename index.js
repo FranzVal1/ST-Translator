@@ -26,7 +26,13 @@ function settings() {
 }
 const translate = createTranslator({headers:getRequestHeaders});
 const reportError = error => toastr.error(String(error?.message ?? error), 'Safe Translation');
-const safely = fn => (...args) => Promise.resolve().then(() => fn(...args)).catch(reportError);
+// Invoke before jQuery continues dispatch and reuses event.currentTarget.
+// Async functions run synchronously up to their first await; catch both sync
+// throws and rejected promises without deferring the event handling itself.
+const safely = fn => async (...args) => {
+    try { return await fn(...args); }
+    catch (error) { reportError(error); }
+};
 
 const runtime = createRuntime({
     getContext, getSettings:settings, translate,

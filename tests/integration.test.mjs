@@ -9,7 +9,8 @@ test('extension UI enables outgoing interceptor and preserves editor original', 
     const $ = jquery(dom.window);
     for (const key of ['document', 'Element', 'HTMLElement', 'HTMLTextAreaElement', 'HTMLInputElement', 'MutationObserver', 'Event', 'InputEvent']) globalThis[key] = dom.window[key];
     globalThis.$ = $;
-    globalThis.toastr = {error:()=>{}, warning:()=>{}, info:()=>{}, clear:()=>{}};
+    const errors = [];
+    globalThis.toastr = {error:message=>errors.push(message), warning:()=>{}, info:()=>{}, clear:()=>{}};
     const events = new Map();
     const settings = {};
     const context = {chatId:'chat', chat:[{mes:'Привет', is_user:true, extra:{}}], saveChat:async()=>{}};
@@ -35,6 +36,21 @@ test('extension UI enables outgoing interceptor and preserves editor original', 
     assert.equal(prompt[0].mes, 'Hello');
     assert.equal(context.chat[0].mes, 'Привет');
     assert.ok(document.querySelector('.safe_translate_button'));
+    // The host also has direct document click handlers. jQuery reuses the same
+    // event object and changes currentTarget after delegated dispatch.
+    $(document).on('click.hostTest', () => {});
+    const button = document.querySelector('.safe_translate_button');
+    const icon = document.createElement('span'); button.append(icon);
+    const click = new dom.window.MouseEvent('click', {bubbles:true, cancelable:true});
+    icon.dispatchEvent(click);
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.deepEqual(errors, [], 'delegated click must not report a translation error');
+    assert.equal(click.defaultPrevented, true);
+    assert.equal(context.chat[0].extra.display_text, 'Hello');
+    button.dispatchEvent(new dom.window.MouseEvent('click', {bubbles:true, cancelable:true}));
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.equal(context.chat[0].extra.display_text, undefined);
+
     document.querySelector('.mes_edit').dispatchEvent(new dom.window.MouseEvent('click', {bubbles:true}));
     const textarea = document.createElement('textarea'); textarea.className='edit_textarea'; textarea.value='Hello';
     document.querySelector('.mes').append(textarea);
