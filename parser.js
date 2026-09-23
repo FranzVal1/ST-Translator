@@ -20,9 +20,12 @@ function tagAttributes(tag) {
 }
 function isOpaque(tag, name, options) {
     if (blockedWholeTags.has(name) || (options.protectedTags ?? []).includes(name)) return true;
-    const attrs = new Map(tagAttributes(tag));
+    const attrs = new Map();
+    for (const [key, value] of tagAttributes(tag)) if (!attrs.has(key)) attrs.set(key, value);
     if (attrs.has('hidden')) return true;
     const style = (attrs.get('style') ?? '').replace(/\/\*[\s\S]*?\*\//g, '');
+    // Encoded/escaped styles or class names need a full CSS/HTML parser. Keep opaque.
+    if (/[&\\]/.test(style) || /&/.test(attrs.get('class') ?? '')) return true;
     if (/(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|content-visibility\s*:\s*hidden)\s*(?:!important\s*)?(?:;|$)/i.test(style)) return true;
     return (attrs.get('class') ?? '').split(/\s+/).some(c => (options.protectedClasses ?? []).includes(c));
 }
@@ -62,18 +65,26 @@ function findServiceBlockEnd(source, openingEnd, tagName) {
     while (cursor < source.length) {
         const nextTagStart = source.indexOf('<', cursor);
         if (nextTagStart < 0) return null;
+        if (source.startsWith('<!--', nextTagStart)) {
+            const end = source.indexOf('-->', nextTagStart + 4);
+            if (end < 0) return null;
+            cursor = end + 3; continue;
+        }
         const nextTagEnd = readHtmlTag(source, nextTagStart);
         if (nextTagEnd < 0) return null;
         const rawTag = source.slice(nextTagStart, nextTagEnd);
         const match = rawTag.match(/^<\s*(\/?)\s*([a-zA-Z][\w:-]*)/);
         const foundName = match?.[2]?.toLowerCase();
+        if (foundName !== tagName && ['script', 'style', 'textarea', 'title'].includes(foundName) && match[1] !== '/') {
+            cursor = findClosingTag(source, nextTagEnd, foundName); continue;
+        }
         if (foundName === tagName) {
             const closing = match[1] === '/';
             const selfClosing = /\/\s*>$/.test(rawTag);
             if (closing) {
                 depth--;
                 if (depth === 0) return nextTagEnd;
-            } else if (!selfClosing) {
+            } else if (!selfClosing || standardHtmlTags.has(foundName)) {
                 depth++;
             }
         }
@@ -133,7 +144,7 @@ function matchProtectedAt(source, index, options) {
     }
 
     if (options.preserveMacros && rest.startsWith('{{')) {
-        return findBalancedMacroEnd(source, index);
+        return findBalancedMacroEnd(source, index) ?? source.length;
     }
 
     if (options.preserveUrls) {
@@ -154,7 +165,8 @@ function matchProtectedAt(source, index, options) {
             const isKnownHtmlTag = Boolean(tagName && standardHtmlTags.has(tagName));
 
             if (tagName && !isClosingTag && isOpaque(rawTag, tagName, options)) {
-                if (isSelfClosingTag || voidTags.has(tagName)) return tagEnd;
+                if (voidTags.has(tagName) || (isSelfClosingTag && !standardHtmlTags.has(tagName))) return tagEnd;
+                if (['script', 'style', 'textarea', 'title'].includes(tagName)) return findClosingTag(source, tagEnd, tagName);
                 return findServiceBlockEnd(source, tagEnd, tagName) ?? source.length;
             }
 
@@ -162,7 +174,7 @@ function matchProtectedAt(source, index, options) {
             if (options.preserveAngleInstructions && !isKnownHtmlTag) {
                 if (tagName && !isClosingTag && !isSelfClosingTag) {
                     const serviceBlockEnd = findServiceBlockEnd(source, tagEnd, tagName);
-                    if (serviceBlockEnd !== null) return serviceBlockEnd;
+                    return serviceBlockEnd ?? source.length;
                 }
                 return tagEnd;
             }
@@ -261,19 +273,20 @@ export function buildPlan(source, options) {
     return { source, tokens, units };
 }
 
-function escapeTranslation(text, attribute = false) {
+function escapeTranslation(text, attribute = false, mode = 'display') {
     if (typeof text !== 'string' || !text.trim()) throw new Error('Переводчик вернул неполный результат.');
     // Provider output is text, never executable markup or a new ST macro.
     if (text.includes('{{') || text.includes('}}')) throw new Error('Переводчик добавил служебный макрос.');
+    if (mode === 'prompt' && !attribute) return text;
     const escaped = text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
     return attribute ? escaped.replaceAll('"', '&quot;').replaceAll("'", '&#39;') : escaped;
 }
 
-export function rebuild(plan, attribute = false) {
+export function rebuild(plan, attribute = false, mode = 'display') {
     return plan.tokens.map((token) => {
         if (token.type === 'text') {
             if (!Number.isInteger(token.unit)) return token.value;
-            const translated = escapeTranslation(plan.units[token.unit].translated, attribute);
+            const translated = escapeTranslation(plan.units[token.unit].translated, attribute, mode);
             return `${token.leading ?? ''}${translated}${token.trailing ?? ''}`;
         }
         if (!token.attributes) return token.value;

@@ -38,3 +38,24 @@ test('macros, URLs and entities in visible attributes stay local', () => {
     assert.equal(result, '<img alt="Привет &quot;друг&quot; {{user}} &amp; https://example.com">');
     validateIntegrity(plan, result);
 });
+
+test('ambiguous hidden styles, duplicate attrs and incomplete macros fail closed', () => {
+    for (const source of [
+        '<div style="display:&#110;one">SECRET</div>',
+        '<div style="display:none" style="color:red">SECRET</div>',
+        '<div style="d\\69splay:none">SECRET</div>',
+        '{{unfinished SECRET',
+        '<instruction>SECRET',
+    ]) assert.deepEqual(buildPlan(source, options).units, [], source);
+});
+
+test('hidden HTML boundaries ignore commented closing tags and non-void self-closing slashes', () => {
+    for (const source of [
+        '<div hidden><!-- > </div> -->SECRET</div>',
+        '<div hidden/>SECRET</div>',
+        '<div hidden><script>"</div>"</script>SECRET</div>',
+    ]) {
+        const plan = buildPlan(source + ' Visible', options);
+        assert.deepEqual(plan.units.map(x=>x.original), ['Visible']);
+    }
+});

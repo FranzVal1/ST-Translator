@@ -1,582 +1,226 @@
-import {
-    eventSource,
-    event_types,
-    getRequestHeaders,
-    saveSettingsDebounced,
-    updateMessageBlock,
-} from '../../../../script.js';
-import {
-    extension_settings,
-    getContext,
-} from '../../../extensions.js';
-import { buildPlan, rebuild, validateIntegrity } from './parser.js';
+import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced, updateMessageBlock } from '../../../../script.js';
+import { extension_settings, getContext } from '../../../extensions.js';
+import { POPUP_TYPE, callGenericPopup } from '../../../popup.js';
+import { createTranslator } from './provider.js';
+import { createRuntime } from './runtime.js';
 
 const MODULE_ID = 'safe_translation';
-const PARSER_VERSION = 10; // Повышено из-за изменения логики батчинга
-const activeJobs = new Map();
-const memoryCache = new Map();
-const sourceSnapshots = new Map();
-const editCheckTimers = new Map();
-let chatObserver = null;
-let initialized = false;
-
-// Уникальный разделитель для батчинга. Маловероятно, что он встретится в тексте.
-const BATCH_SEPARATOR = '\n[[ST_SEG]]\n';
-
 const defaults = Object.freeze({
-    enabled: true,
-    provider: 'google',
-    targetLanguage: 'ru',
-    autoIncoming: true,
-    translateAttributes: false,
-    translateTitle: true,
-    translateAlt: true,
-    translatePlaceholder: true,
-    translateAriaLabel: true,
-    preserveCode: true,
-    preserveMacros: true,
-    preserveUrls: true,
-    preserveAngleInstructions: true,
-    minTextLength: 1,
-    timeoutMs: 30000,
-    retries: 1,
-    cache: true,
-    debug: false,
+    enabled:true, provider:'google', targetLanguage:'ru', autoIncoming:true,
+    autoOutgoing:false, outgoingLanguage:'en', translateAttributes:false,
+    translateTitle:true, translateAlt:true, translatePlaceholder:true, translateAriaLabel:true,
+    preserveCode:true, preserveMacros:true, preserveUrls:true, preserveAngleInstructions:true,
+    protectedTags:[], protectedClasses:[], minTextLength:1, timeoutMs:30000, retries:1, cache:true, debug:false,
 });
+let initialized = false;
+let chatObserver;
+let buttonUpdatePending = false;
+const editObservers = new Set();
 
 function settings() {
-    if (!extension_settings[MODULE_ID] || typeof extension_settings[MODULE_ID] !== 'object') {
-        extension_settings[MODULE_ID] = {};
-    }
+    extension_settings[MODULE_ID] ??= {};
     for (const [key, value] of Object.entries(defaults)) {
-        if (!Object.hasOwn(extension_settings[MODULE_ID], key)) {
-            extension_settings[MODULE_ID][key] = value;
-        }
+        if (!Object.hasOwn(extension_settings[MODULE_ID], key)) extension_settings[MODULE_ID][key] = structuredClone(value);
     }
     return extension_settings[MODULE_ID];
 }
+const translate = createTranslator({headers:getRequestHeaders});
+const reportError = error => toastr.error(String(error?.message ?? error), 'Safe Translation');
+const safely = fn => (...args) => Promise.resolve().then(() => fn(...args)).catch(reportError);
 
-function log(...args) {
-    if (settings().debug) console.debug('[Safe Translation]', ...args);
-}
+const runtime = createRuntime({
+    getContext, getSettings:settings, translate,
+    update(id, message, busy) {
+        // Do not rerender the message while its editor is open.
+        const node = document.querySelector(`#chat .mes[mesid="${id}"]`);
+        if (!busy && !node?.querySelector('textarea, [contenteditable="true"]')) updateMessageBlock(id, message);
+        const button = node?.querySelector('.safe_translate_button');
+        if (button) {
+            button.classList.toggle('fa-spin', busy);
+            button.classList.toggle('disabled', busy);
+            button.setAttribute('aria-busy', String(busy));
+        }
+    },
+    notify:reportError,
+    progress({running, done, total, failed}) {
+        $('#st_safe_progress').text(`Обработано ${done} из ${total} · Ошибок: ${failed}`);
+        $('#st_safe_translate_chat').prop('disabled', running);
+        $('#st_safe_stop').prop('disabled', !running);
+        $('#st_safe_retry').prop('disabled', running || !failed);
+    },
+    async ask() {
+        // No server response or source text is inserted as HTML into the dialog.
+        const choice = await callGenericPopup('Не удалось перевести реплику игрока. Генерация ожидает решения. «Отправить оригинал» разрешает использовать исходный текст только в этой генерации.', POPUP_TYPE.CONFIRM, '', {
+            okButton:'Повторить', cancelButton:'Отмена', defaultResult:0,
+            customButtons:[{text:'Отправить оригинал', result:1001}],
+        });
+        return choice === 1 ? 'retry' : choice === 1001 ? 'original' : 'cancel';
+    },
+});
 
 function makeSettingsHtml() {
-    const s = settings();
-    return `
-    <div id="safe_translation_settings" class="safe-translation-settings">
-      <div class="inline-drawer">
-        <div class="inline-drawer-toggle inline-drawer-header">
-          <b>Safe Translation</b>
-          <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    return `<div id="safe_translation_settings" class="safe-translation-settings">
+    <div class="inline-drawer">
+      <div class="inline-drawer-toggle inline-drawer-header"><b>Safe Translation</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
+      <div class="inline-drawer-content">
+        <label class="checkbox_label"><input id="st_safe_enabled" type="checkbox"> Включить модуль</label>
+        <label class="checkbox_label"><input id="st_safe_auto" type="checkbox"> Автоперевод ответов персонажа</label>
+        <label for="st_safe_provider">Переводчик</label><select id="st_safe_provider" class="text_pole"><option value="google">Google</option><option value="yandex">Yandex</option><option value="bing">Bing</option></select>
+        <label for="st_safe_language">Язык отображения ответов</label><select id="st_safe_language" class="text_pole"></select>
+        <label class="checkbox_label"><input id="st_safe_outgoing" type="checkbox"> Переводить реплики игрока для LLM</label>
+        <label for="st_safe_outgoing_language">Язык реплик игрока для LLM</label><select id="st_safe_outgoing_language" class="text_pole"></select>
+        <small>Оригинал остаётся в чате и редакторе. При генерации переводятся реплики игрока в истории; кнопка сообщения показывает сохранённую версию для LLM. Это отправляет их текст выбранному переводчику. Код, макросы и защищённые инструкции не переводятся.</small>
+        <label class="checkbox_label"><input id="st_safe_attrs" type="checkbox"> Переводить title, alt, placeholder, aria-label</label>
+        <label class="checkbox_label"><input id="st_safe_angle" type="checkbox"> Защищать служебные блоки &lt;...&gt;</label>
+        <label for="st_safe_tags">Дополнительные защищённые теги (через запятую)</label><input id="st_safe_tags" class="text_pole" placeholder="aside, custom-block">
+        <label for="st_safe_classes">Защищённые CSS-классы (через запятую)</label><input id="st_safe_classes" class="text_pole" placeholder="secret, hidden-instruction">
+        <small>hidden и явные inline-стили display:none / visibility:hidden защищены автоматически. Внешние CSS-правила не вычисляются — добавьте их классы выше.</small>
+        <label class="checkbox_label"><input id="st_safe_cache" type="checkbox"> Кэшировать переводы в памяти</label>
+        <div class="safe-translation-actions">
+          <button id="st_safe_translate_chat" class="menu_button">Перевести ответы в чате</button>
+          <button id="st_safe_stop" class="menu_button" disabled>Остановить</button>
+          <button id="st_safe_retry" class="menu_button" disabled>Повторить ошибки</button>
+          <button id="st_safe_clear_chat" class="menu_button">Удалить переводы</button>
+          <button id="st_safe_clear_cache" class="menu_button">Очистить кэш</button>
         </div>
-        <div class="inline-drawer-content">
-          <label class="checkbox_label"><input id="st_safe_enabled" type="checkbox" ${s.enabled ? 'checked' : ''}> Включить модуль</label>
-          <label class="checkbox_label"><input id="st_safe_auto" type="checkbox" ${s.autoIncoming ? 'checked' : ''}> Автоматически переводить ответы персонажа</label>
-          <label>Переводчик</label>
-          <select id="st_safe_provider" class="text_pole">
-            <option value="google" ${s.provider === 'google' ? 'selected' : ''}>Google</option>
-            <option value="yandex" ${s.provider === 'yandex' ? 'selected' : ''}>Yandex</option>
-            <option value="bing" ${s.provider === 'bing' ? 'selected' : ''}>Bing</option>
-          </select>
-          <label>Язык перевода</label>
-          <select id="st_safe_language" class="text_pole">
-            <option value="ru" ${s.targetLanguage === 'ru' ? 'selected' : ''}>Русский</option>
-            <option value="en" ${s.targetLanguage === 'en' ? 'selected' : ''}>English</option>
-            <option value="de" ${s.targetLanguage === 'de' ? 'selected' : ''}>Deutsch</option>
-            <option value="fr" ${s.targetLanguage === 'fr' ? 'selected' : ''}>Français</option>
-            <option value="es" ${s.targetLanguage === 'es' ? 'selected' : ''}>Español</option>
-            <option value="zh-CN" ${s.targetLanguage === 'zh-CN' ? 'selected' : ''}>中文</option>
-            <option value="ja" ${s.targetLanguage === 'ja' ? 'selected' : ''}>日本語</option>
-          </select>
-          <label class="checkbox_label"><input id="st_safe_attrs" type="checkbox" ${s.translateAttributes ? 'checked' : ''}> Переводить видимые атрибуты (title, alt, placeholder, aria-label)</label>
-          <label class="checkbox_label"><input id="st_safe_angle" type="checkbox" ${s.preserveAngleInstructions ? 'checked' : ''}> Не переводить служебные блоки в &lt;...&gt;</label>
-          <label class="checkbox_label"><input id="st_safe_cache" type="checkbox" ${s.cache ? 'checked' : ''}> Кешировать сегменты</label>
-          <label class="checkbox_label"><input id="st_safe_debug" type="checkbox" ${s.debug ? 'checked' : ''}> Диагностический журнал</label>
-          <div class="safe-translation-actions">
-            <button id="st_safe_translate_chat" class="menu_button">Перевести текущий чат</button>
-            <button id="st_safe_clear_chat" class="menu_button">Убрать переводы</button>
-          </div>
-          <small>HTML, макросы, код, URL защищены от отправки переводчику. Текст переводится батчами для сохранения контекста.</small>
-        </div>
+        <div id="st_safe_progress" role="status" aria-live="polite"></div>
+        <small>Отключите автоматические режимы встроенного Chat Translation: два автопереводчика одновременно не поддерживаются.</small>
       </div>
-    </div>`;
+    </div></div>`;
 }
 
 function bindSettings() {
-    const bindCheckbox = (id, key) => $(id).on('change', function () {
-        settings()[key] = Boolean(this.checked);
-        saveSettingsDebounced();
-    });
-    bindCheckbox('#st_safe_enabled', 'enabled');
-    bindCheckbox('#st_safe_auto', 'autoIncoming');
-    bindCheckbox('#st_safe_attrs', 'translateAttributes');
-    bindCheckbox('#st_safe_angle', 'preserveAngleInstructions');
-    bindCheckbox('#st_safe_cache', 'cache');
-    bindCheckbox('#st_safe_debug', 'debug');
-    $('#st_safe_provider').on('change', function () {
-        settings().provider = String(this.value);
-        saveSettingsDebounced();
-    });
-    $('#st_safe_language').on('change', function () {
-        settings().targetLanguage = String(this.value);
-        saveSettingsDebounced();
-    });
-    $('#st_safe_translate_chat').on('click', translateCurrentChat);
-    $('#st_safe_clear_chat').on('click', clearCurrentChatTranslations);
-}
-
-function parserOptions() {
-    const s = settings();
-    return {
-        preserveCode: s.preserveCode,
-        preserveMacros: s.preserveMacros,
-        preserveUrls: s.preserveUrls,
-        preserveAngleInstructions: s.preserveAngleInstructions,
-        translateAttributes: s.translateAttributes,
-        translateTitle: s.translateTitle,
-        translateAlt: s.translateAlt,
-        translatePlaceholder: s.translatePlaceholder,
-        translateAriaLabel: s.translateAriaLabel,
-        minTextLength: s.minTextLength,
+    const languages = {ru:'Русский', en:'English', de:'Deutsch', fr:'Français', es:'Español', 'zh-CN':'中文', ja:'日本語'};
+    for (const selector of ['#st_safe_language', '#st_safe_outgoing_language']) {
+        for (const [value, text] of Object.entries(languages)) $(selector).append($('<option>').val(value).text(text));
+    }
+    const bindings = {
+        st_safe_enabled:'enabled', st_safe_auto:'autoIncoming', st_safe_outgoing:'autoOutgoing',
+        st_safe_provider:'provider', st_safe_language:'targetLanguage', st_safe_outgoing_language:'outgoingLanguage',
+        st_safe_attrs:'translateAttributes', st_safe_angle:'preserveAngleInstructions', st_safe_cache:'cache',
+        st_safe_tags:'protectedTags', st_safe_classes:'protectedClasses',
     };
-}
-
-const providerChunkLimits = Object.freeze({ google: 5000, yandex: 5000, bing: 1000 });
-
-function splitForProvider(text, maxLength) {
-    if (text.length <= maxLength) return [text];
-    const chunks = [];
-    let rest = text;
-    while (rest.length > maxLength) {
-        let cut = rest.lastIndexOf('\n', maxLength);
-        if (cut < Math.floor(maxLength * 0.5)) cut = rest.lastIndexOf(' ', maxLength);
-        // Fallback: если пробелов нет вообще, режем принудительно, чтобы не зависнуть в цикле
-        if (cut < Math.floor(maxLength * 0.5)) cut = maxLength; 
-        else cut += 1;
-        chunks.push(rest.slice(0, cut));
-        rest = rest.slice(cut);
+    for (const [id, key] of Object.entries(bindings)) {
+        const input = $(`#${id}`);
+        const isCheckbox = input.attr('type') === 'checkbox';
+        const isList = ['protectedTags','protectedClasses'].includes(key);
+        if (isCheckbox) input.prop('checked', settings()[key]);
+        else input.val(isList ? settings()[key].join(', ') : settings()[key]);
+        input.on('change', function () {
+            let value = isCheckbox ? this.checked : String(this.value);
+            if (isList) value = value.split(/[\s,]+/).map(x => key === 'protectedTags' ? x.toLowerCase() : x).filter(Boolean);
+            settings()[key] = value;
+            runtime.invalidate();
+            saveSettingsDebounced();
+        });
     }
-    if (rest) chunks.push(rest);
-    return chunks;
+    $('#st_safe_translate_chat').on('click', safely(() => runtime.translateChat()));
+    $('#st_safe_retry').on('click', safely(() => runtime.translateChat(true)));
+    $('#st_safe_stop').on('click', () => runtime.stop());
+    $('#st_safe_clear_chat').on('click', safely(async () => {
+        const confirmed = await callGenericPopup('Удалить сохранённые переводы Safe Translation? Оригиналы и переводы других расширений останутся.', POPUP_TYPE.CONFIRM);
+        if (confirmed === 1) await runtime.clear();
+    }));
+    $('#st_safe_clear_cache').on('click', () => { translate.clearCache(); toastr.info('Кэш очищен', 'Safe Translation'); });
 }
 
-async function providerRequest(text, language, provider, signal) {
-    let url;
-    let body;
-    switch (provider) {
-        case 'google':
-        case 'bing':
-            url = `/api/translate/${provider}`;
-            body = { text, lang: language };
-            break;
-        // Возвращаем оригинальный формат payload для Yandex
-        case 'yandex':
-            url = '/api/translate/yandex';
-            body = { chunks: [text], lang: language };
-            break;
-        default:
-            throw new Error(`Неизвестный переводчик: ${provider}`);
-    }
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify(body),
-        signal,
-    });
-    if (!response.ok) {
-        let errorText = `HTTP ${response.status}`;
-        try {
-            const errData = await response.json();
-            errorText = errData.error || errData.message || JSON.stringify(errData);
-        } catch (e) {
-            errorText = (await response.text().catch(() => '')).slice(0, 200) || errorText;
-        }
-        throw new Error(`${provider}: ${errorText}`);
-    }
-    const result = await response.text();
-    if (!result || /^<!doctype html/i.test(result.trim()) || /^<html/i.test(result.trim())) {
-        throw new Error(`${provider}: сервер вернул некорректный ответ (HTML)`);
-    }
-    return result;
+function resolveId(payload) {
+    const value = payload && typeof payload === 'object' ? payload.messageId ?? payload.mesId ?? payload.id ?? payload.index : payload;
+    if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null;
+    const id = Number(value);
+    return Number.isInteger(id) && id >= 0 ? id : null;
 }
-
-function cacheKey(text, language, provider) {
-    return `${PARSER_VERSION}|${provider}|${language}|${text}`;
-}
-
-async function translateSegment(text, signal) {
-    const s = settings();
-    const key = cacheKey(text, s.targetLanguage, s.provider);
-    if (s.cache && memoryCache.has(key)) return memoryCache.get(key);
-
-    const limit = providerChunkLimits[s.provider] ?? 1000;
-    const chunks = splitForProvider(text, limit);
-    let output = '';
-    for (const chunk of chunks) {
-        let lastError;
-        let translated = null;
-        for (let attempt = 0; attempt <= s.retries; attempt++) {
-            try {
-                translated = await providerRequest(chunk, s.targetLanguage, s.provider, signal);
-                break;
-            } catch (error) {
-                lastError = error;
-                if (signal.aborted) throw error;
-                if (attempt < s.retries) await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-            }
-        }
-        if (translated === null) throw lastError;
-        output += translated;
-    }
-    if (s.cache) memoryCache.set(key, output);
-    return output;
-}
-
-async function translateSafely(source, externalSignal) {
-    const plan = buildPlan(source, parserOptions());
-    if (!plan.units.length) return source;
-
-    const textUnits = plan.units.filter(u => u.kind === 'text' && u.translated === null);
-    const attrUnits = plan.units.filter(u => u.kind === 'attribute' && u.translated === null);
-
-    async function translateBatch(units) {
-        if (!units.length) return;
-        const combined = units.map(u => u.original).join(BATCH_SEPARATOR);
-        const limit = providerChunkLimits[settings().provider] ?? 1000;
-        const chunks = splitForProvider(combined, limit);
-        
-        let translatedCombined = '';
-        for (const chunk of chunks) {
-            if (externalSignal.aborted) throw externalSignal.reason ?? new DOMException('Aborted', 'AbortError');
-            translatedCombined += await translateSegment(chunk, externalSignal);
-        }
-
-        // Переводчик может добавить пробелы вокруг разделителя
-        const translatedParts = translatedCombined.split(/\n?\[\[ST_SEG\]\]\n?/);
-        
-        if (translatedParts.length === units.length) {
-            units.forEach((unit, index) => {
-                unit.translated = translatedParts[index];
-            });
-        } else {
-            // Fallback: если переводчик "съел" разделители, переводим по одному
-            console.warn('[Safe Translation] Batch split failed. Falling back to sequential.');
-            for (const unit of units) {
-                if (externalSignal.aborted) throw externalSignal.reason ?? new DOMException('Aborted', 'AbortError');
-                unit.translated = await translateSegment(unit.original, externalSignal);
-            }
-        }
-    }
-
-    await translateBatch(textUnits);
-    await translateBatch(attrUnits);
-
-    const result = rebuild(plan);
-    validateIntegrity(plan, result);
-    return result;
-}
-
-function getMessageIdFromElement(element) {
-    const messageElement = element?.closest?.('.mes');
-    if (!messageElement) return null;
-    const id = Number(messageElement.getAttribute('mesid'));
-    return Number.isInteger(id) ? id : null;
-}
-
-function isEditControl(element) {
-    if (!(element instanceof Element)) return false;
-    return Boolean(element.closest([
-        '.mes_edit',
-        '.edit_message',
-        '[data-action="edit"]',
-        '[title="Edit"]',
-        '[title="Редактировать"]',
-        '.fa-pencil',
-        '.fa-pen',
-        '.fa-edit',
-    ].join(',')));
-}
-
-function putOriginalIntoEditor(messageElement, original) {
-    const candidates = [
-        ...messageElement.querySelectorAll('textarea'),
-        ...messageElement.querySelectorAll('[contenteditable="true"]'),
-    ];
-    if (!candidates.length) return false;
-
-    let changed = false;
-    for (const editor of candidates) {
-        if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {
-            if (editor.value !== original) {
-                editor.value = original;
-                editor.dispatchEvent(new Event('input', { bubbles: true }));
-                changed = true;
-            }
-            continue;
-        }
-        if (editor instanceof HTMLElement) {
-            if (editor.textContent !== original) {
-                editor.textContent = original;
-                editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: null }));
-                changed = true;
-            }
-        }
-    }
-    return changed;
-}
-
-function handleEditCapture(event) {
-    const target = event.target;
-    if (!isEditControl(target)) return;
-
-    const messageElement = target.closest('.mes');
-    const id = getMessageIdFromElement(target);
-    if (!messageElement || id === null) return;
-
-    const message = getContext().chat[id];
-    if (!message || typeof message.mes !== 'string') return;
-
-    // Наблюдатель за появлением textarea внутри конкретного сообщения
-    const observer = new MutationObserver((mutations, obs) => {
-        const textarea = messageElement.querySelector('textarea.edit_textarea, [contenteditable="true"]');
-        if (textarea) {
-            putOriginalIntoEditor(messageElement, message.mes);
-            obs.disconnect();
-        }
-    });
-
-    observer.observe(messageElement, { childList: true, subtree: true, attributes: true });
-    putOriginalIntoEditor(messageElement, message.mes);
-    setTimeout(() => observer.disconnect(), 2000);
-}
-
-function resolveMessageId(payload) {
-    if (Number.isInteger(Number(payload))) return Number(payload);
-    if (payload && typeof payload === 'object') {
-        for (const key of ['messageId', 'mesId', 'id', 'index']) {
-            if (Number.isInteger(Number(payload[key]))) return Number(payload[key]);
-        }
-    }
-    return null;
-}
-
-function rememberCurrentSources() {
-    const chat = getContext().chat ?? [];
-    sourceSnapshots.clear();
-    for (let id = 0; id < chat.length; id++) {
-        const message = chat[id];
-        if (message && typeof message.mes === 'string') {
-            sourceSnapshots.set(id, message.mes);
+function prepareMessages() {
+    for (const message of getContext().chat ?? []) {
+        message.extra ??= {};
+        // v1.2 owned display migration: keep it reversible after upgrading.
+        const record = message.extra.safe_translation;
+        if (record?.version === 1 && !record.translatedText && typeof message.extra.display_text === 'string') {
+            record.source = message.mes; record.translatedText = message.extra.display_text;
         }
     }
 }
-
-async function checkEditedMessage(id) {
-    const context = getContext();
-    const message = context.chat[id];
-    if (!message || message.is_system || message.is_user || typeof message.mes !== 'string') return;
-
-    const previousSource = sourceSnapshots.get(id);
-    const currentSource = message.mes;
-
-    if (previousSource === undefined) {
-        sourceSnapshots.set(id, currentSource);
-        return;
-    }
-    if (previousSource === currentSource) return;
-
-    sourceSnapshots.set(id, currentSource);
-    activeJobs.get(id)?.abort();
-
-    message.extra ??= {};
-    delete message.extra.display_text;
-    delete message.extra.safe_translation;
-    updateMessageBlock(id, message);
-    await context.saveChat();
-
-    if (settings().enabled && settings().autoIncoming) {
-        setTimeout(() => translateMessage(id, true), 100);
-    }
-}
-
-function scheduleEditedMessageCheck(payload) {
-    const id = resolveMessageId(payload);
-    if (id === null) return;
-
-    clearTimeout(editCheckTimers.get(id));
-    const timer = setTimeout(async () => {
-        editCheckTimers.delete(id);
-        await checkEditedMessage(id);
-    }, 75);
-    editCheckTimers.set(id, timer);
-}
-
-async function handleMessageUpdated(payload) {
-    scheduleEditedMessageCheck(payload);
-}
-
-async function translateMessage(messageId, force = false) {
-    const s = settings();
-    if (!s.enabled) return;
-    const context = getContext();
-    const id = Number(messageId);
-    const message = context.chat[id];
-    if (!message || message.is_system || message.is_user || typeof message.mes !== 'string') return;
-
-    message.extra ??= {};
-    const source = message.mes;
-    sourceSnapshots.set(id, source);
-    const signature = `${PARSER_VERSION}|${s.provider}|${s.targetLanguage}|${source}`;
-    if (!force && message.extra.safe_translation?.signature === signature && message.extra.display_text) return;
-
-    activeJobs.get(id)?.abort();
-    const controller = new AbortController();
-    activeJobs.set(id, controller);
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-    }, s.timeoutMs);
-    setMessageBusy(id, true);
-    try {
-        const translated = await translateSafely(source, controller.signal);
-        if (activeJobs.get(id) !== controller) return;
-
-        const liveContext = getContext();
-        const liveMessage = liveContext.chat[id];
-        if (!liveMessage || liveMessage.mes !== source || liveMessage.is_user || liveMessage.is_system) return;
-        liveMessage.extra ??= {};
-        liveMessage.extra.safe_translation = {
-            version: 1,
-            signature,
-            provider: s.provider,
-            targetLanguage: s.targetLanguage,
-            translatedAt: Date.now(),
-        };
-        liveMessage.extra.display_text = translated;
-        updateMessageBlock(id, liveMessage);
-        await liveContext.saveChat();
-    } catch (error) {
-        if (timedOut) {
-            console.error('[Safe Translation] Timeout', error);
-            toastr.error('Истекло время ожидания перевода.', 'Safe Translation');
-        } else if (!controller.signal.aborted) {
-            console.error('[Safe Translation]', error);
-            toastr.error(error instanceof Error ? error.message : String(error), 'Safe Translation');
-        }
-    } finally {
-        clearTimeout(timeout);
-        if (activeJobs.get(id) === controller) activeJobs.delete(id);
-        setMessageBusy(id, false);
-    }
-}
-
-function setMessageBusy(id, busy) {
-    const button = $(`#chat .mes[mesid="${id}"] .safe_translate_button`);
-    button.toggleClass('fa-spin', busy).toggleClass('disabled', busy);
-}
-
-async function handleIncoming(messageId) {
-    const id = resolveMessageId(messageId);
-    if (id === null) return;
-    const message = getContext().chat[id];
-    if (message && typeof message.mes === 'string') sourceSnapshots.set(id, message.mes);
-    if (settings().autoIncoming) await translateMessage(id, false);
-}
-
-async function onMessageButtonClick(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    const id = Number($(event.currentTarget).closest('.mes').attr('mesid'));
-    const context = getContext();
-    const message = context.chat[id];
-    if (!message) return;
-    if (message.extra?.display_text) {
-        delete message.extra.display_text;
-        updateMessageBlock(id, message);
-        await context.saveChat();
-        return;
-    }
-    await translateMessage(id, true);
-}
-
 function addButtons(root = document) {
-    $(root).find('#chat .mes').each(function () {
-        const message = $(this);
-        if (message.find('.safe_translate_button').length) return;
-        const target = message.find('.extraMesButtons, .mes_buttons').first();
-        if (!target.length) return;
-        target.append('<div class="mes_button safe_translate_button fa-solid fa-language interactable" title="Safe Translation" tabindex="0"></div>');
-    });
-}
-
-async function translateCurrentChat() {
-    const context = getContext();
-    const toast = toastr.info('Перевод сообщений запущен', 'Safe Translation');
-    try {
-        for (let i = 0; i < context.chat.length; i++) {
-            await translateMessage(i, false);
-        }
-    } finally {
-        toastr.clear(toast);
+    const messages = [...(root.matches?.('.mes') ? [root] : []), ...root.querySelectorAll('.mes')];
+    for (const message of messages) {
+        if (!message.closest('#chat') || message.querySelector('.safe_translate_button')) continue;
+        const target = message.querySelector('.extraMesButtons, .mes_buttons');
+        if (!target) continue;
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'mes_button safe_translate_button fa-solid fa-language interactable';
+        button.title = 'Safe Translation: оригинал / перевод'; button.setAttribute('aria-label', button.title);
+        target.append(button);
     }
 }
-
-async function clearCurrentChatTranslations() {
-    for (const controller of activeJobs.values()) controller.abort();
-    activeJobs.clear();
-    const context = getContext();
-    for (const message of context.chat) {
-        if (!message.extra) continue;
-        delete message.extra.display_text;
-        delete message.extra.safe_translation;
+function editCapture(event) {
+    const target = event.target instanceof Element ? event.target.closest('.mes_edit, .edit_message, [data-action="edit"]') : null;
+    if (!target) return;
+    const node = target.closest('.mes');
+    const id = resolveId(node?.getAttribute('mesid'));
+    const message = id === null ? null : getContext().chat[id];
+    if (!message || !node) return;
+    const original = message.mes;
+    let timer;
+    const observer = new MutationObserver(putOriginal);
+    const disconnect = () => { observer.disconnect(); clearTimeout(timer); editObservers.delete(disconnect); };
+    function putOriginal() {
+        const editor = node.querySelector('textarea.edit_textarea, [contenteditable="true"]');
+        if (!editor) return;
+        disconnect();
+        if (editor instanceof HTMLTextAreaElement) editor.value = original;
+        else editor.textContent = original;
+        editor.dispatchEvent(new Event('input', {bubbles:true}));
     }
-    await context.saveChat();
-    for (let i = 0; i < context.chat.length; i++) {
-        updateMessageBlock(i, context.chat[i]);
-    }
-}
-
-function handleChatChanged() {
-    for (const controller of activeJobs.values()) controller.abort();
-    activeJobs.clear();
-    for (const timer of editCheckTimers.values()) clearTimeout(timer);
-    editCheckTimers.clear();
-    setTimeout(() => {
-        rememberCurrentSources();
-        addButtons();
-    }, 50);
+    editObservers.add(disconnect);
+    observer.observe(node, {childList:true, subtree:true});
+    timer = setTimeout(disconnect, 2000);
+    putOriginal();
 }
 
 export async function init() {
     if (initialized) return;
     initialized = true;
-    settings();
-    if (!document.getElementById('safe_translation_settings')) {
-        $('#extensions_settings2').append(makeSettingsHtml());
-        bindSettings();
-    }
-    $(document).off('click.safeTranslation', '.safe_translate_button')
-        .on('click.safeTranslation', '.safe_translate_button', onMessageButtonClick);
-    document.removeEventListener('click', handleEditCapture, true);
-    document.addEventListener('click', handleEditCapture, true);
-
-    eventSource.off?.(event_types.CHARACTER_MESSAGE_RENDERED, handleIncoming);
-    eventSource.off?.(event_types.MESSAGE_SWIPED, handleIncoming);
-    eventSource.off?.(event_types.CHAT_CHANGED, handleChatChanged);
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handleIncoming);
-    eventSource.on(event_types.MESSAGE_SWIPED, handleIncoming);
-    eventSource.on(event_types.CHAT_CHANGED, handleChatChanged);
-    if (event_types.MESSAGE_UPDATED) {
-        eventSource.off?.(event_types.MESSAGE_UPDATED, handleMessageUpdated);
-        eventSource.on(event_types.MESSAGE_UPDATED, handleMessageUpdated);
-    }
-
-    chatObserver?.disconnect();
-    chatObserver = new MutationObserver(() => addButtons());
+    settings(); prepareMessages();
+    $('#extensions_settings2').append(makeSettingsHtml()); bindSettings();
+    $(document).on('click.safeTranslation', '.safe_translate_button', safely(async event => {
+        event.preventDefault(); event.stopPropagation();
+        const id = resolveId(event.currentTarget.closest('.mes')?.getAttribute('mesid'));
+        if (id !== null) await runtime.toggle(id);
+    }));
+    document.addEventListener('click', editCapture, true);
+    const incoming = safely(async payload => {
+        const id = resolveId(payload);
+        if (id === null) return;
+        prepareMessages(); addButtons();
+        if (settings().autoIncoming) await runtime.translateMessage(id);
+    });
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, incoming);
+    eventSource.on(event_types.MESSAGE_SWIPED, incoming);
+    eventSource.on(event_types.MESSAGE_SENT, prepareMessages);
+    if (event_types.MESSAGE_UPDATED) eventSource.on(event_types.MESSAGE_UPDATED, safely(async payload => {
+        const id = resolveId(payload); if (id !== null) await runtime.edited(id);
+    }));
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        runtime.invalidate();
+        for (const disconnect of [...editObservers]) disconnect();
+        prepareMessages(); addButtons();
+    });
+    if (event_types.GENERATION_STOPPED) eventSource.on(event_types.GENERATION_STOPPED, () => runtime.invalidate());
+    chatObserver = new MutationObserver(() => {
+        if (buttonUpdatePending) return;
+        buttonUpdatePending = true;
+        queueMicrotask(() => { buttonUpdatePending = false; addButtons(); });
+    });
     const chat = document.getElementById('chat');
-    if (chat) chatObserver.observe(chat, { childList: true, subtree: true });
-    rememberCurrentSources();
+    if (chat) chatObserver.observe(chat, {childList:true, subtree:true});
     addButtons();
-    log('Initialized');
 }
+
+// manifest.generate_interceptor resolves a global function, not an ES module export.
+globalThis.safeTranslationInterceptor = async (chat, _contextSize, abort, _type) => {
+    const builtin = extension_settings.translate?.auto_mode;
+    if (settings().enabled && settings().autoOutgoing && ['inputs','both'].includes(builtin)) {
+        abort(true); reportError('Отключите исходящий автоперевод встроенного Chat Translation.'); return;
+    }
+    await runtime.intercept(chat, abort);
+};

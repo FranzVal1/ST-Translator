@@ -1,7 +1,7 @@
 import { PARSER_VERSION, providerChunkLimits, translateSafely } from './translation.js';
 
 export function translationSignature(source, settings) {
-    const keys = ['provider', 'targetLanguage', 'preserveCode', 'preserveMacros', 'preserveUrls', 'preserveAngleInstructions', 'translateAttributes', 'translateTitle', 'translateAlt', 'translatePlaceholder', 'translateAriaLabel', 'minTextLength', 'protectedTags', 'protectedClasses'];
+    const keys = ['provider', 'targetLanguage', 'preserveCode', 'preserveMacros', 'preserveUrls', 'preserveAngleInstructions', 'translateAttributes', 'translateTitle', 'translateAlt', 'translatePlaceholder', 'translateAriaLabel', 'minTextLength', 'protectedTags', 'protectedClasses', 'outputMode'];
     return JSON.stringify([PARSER_VERSION, ...keys.map(k => settings[k]), source]);
 }
 
@@ -18,6 +18,7 @@ function delay(ms, signal) {
 export function createTranslator({fetchFn = fetch, headers, maxCacheChars = 2_000_000}) {
     const cache = new Map();
     let cacheChars = 0;
+    const sizeOf = value => typeof value === 'string' ? value.length : JSON.stringify(value).length;
     const translate = async (source, settings, signal) => {
         // Do not retain a live settings object across await boundaries.
         const s = structuredClone(settings);
@@ -70,11 +71,15 @@ export function createTranslator({fetchFn = fetch, headers, maxCacheChars = 2_00
             }
         };
         const result = await translateSafely(source, s, request, signal, providerChunkLimits[s.provider]);
-        if (s.cache && key.length + result.length <= maxCacheChars) {
-            cache.set(key, result); cacheChars += key.length + result.length;
+        if (s.cache && key.length + sizeOf(result) <= maxCacheChars) {
+            if (cache.has(key)) {
+                cacheChars -= key.length + sizeOf(cache.get(key));
+                cache.delete(key);
+            }
+            cache.set(key, result); cacheChars += key.length + sizeOf(result);
             while (cacheChars > maxCacheChars) {
                 const oldest = cache.keys().next().value;
-                cacheChars -= oldest.length + cache.get(oldest).length;
+                cacheChars -= oldest.length + sizeOf(cache.get(oldest));
                 cache.delete(oldest);
             }
         }
