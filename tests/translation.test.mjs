@@ -16,3 +16,29 @@ test('split never exceeds provider limit or breaks surrogate pairs', () => {
         assert.ok(chunks.every(x => x.length <= 10 && !/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(x)));
     }
 });
+
+test('corrupted, duplicated or reordered markers retry only that batch', async () => {
+    for (const mode of ['missing','duplicate','reordered']) {
+        const calls=[];
+        const result=await translateSafely('<b>First</b> <i>Second</i>',options,async text=>{
+            calls.push(text);
+            const markers=text.match(/\[\[ST_[^\]]+\]\]/g);
+            if (!markers) return text.toUpperCase();
+            if (mode==='missing') return text.replace(markers[0],'');
+            if (mode==='duplicate') return text+markers[0];
+            return text.replace(markers[0],'TEMP').replace(markers[1],markers[0]).replace('TEMP',markers[1]);
+        },new AbortController().signal,1000);
+        assert.equal(result,'<b>FIRST</b> <i>SECOND</i>');
+        assert.equal(calls.length,3);
+    }
+});
+test('cancellation during batching prevents fallback requests',async()=>{
+    const c=new AbortController();let calls=0;
+    await assert.rejects(translateSafely('<b>First</b> <i>Second</i>',options,async()=>{calls++;c.abort();return 'bad';},c.signal,1000),{name:'AbortError'});
+    assert.equal(calls,1);
+});
+
+test('outgoing serialization separates literal prompt text from safe display HTML', async () => {
+    const result = await translateSafely('Hello &amp; {{user}}', {...options, outputMode:'both'}, async()=> 'Tom & Jerry < 5', new AbortController().signal, 1000);
+    assert.deepEqual(result, {prompt:'Tom & Jerry < 5 &amp; {{user}}', display:'Tom &amp; Jerry &lt; 5 &amp; {{user}}'});
+});

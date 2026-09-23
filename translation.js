@@ -72,5 +72,5 @@ export async function translateSafely(source, options, request, signal, limit = 
     signal.throwIfAborted();
     const result = rebuild(plan);
     validateIntegrity(plan, result);
-    return result;
+    return options.outputMode === 'both' ? {prompt:rebuild(plan, false, 'prompt'), display:result} : result;
 }

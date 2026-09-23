@@ -22,3 +22,13 @@ test('request timeout rejects, and cancellation stops retries', async () => {
     const controller = new AbortController(); controller.abort();
     await assert.rejects(translator('Привет', options, controller.signal), {name:'AbortError'});
 });
+
+test('concurrent identical translations keep LRU accounting bounded', async () => {
+    const {translationSignature} = await import('../provider.js');
+    let calls = 0;
+    const t = createTranslator({headers:()=>({}), maxCacheChars:translationSignature('Hello',options).length + 5,
+        fetchFn:async()=>{ calls++; return new Response('Hello'); }});
+    await Promise.all(Array.from({length:3},()=>t('Hello',options,new AbortController().signal)));
+    await t('Hello',options,new AbortController().signal);
+    assert.equal(calls, 3);
+});

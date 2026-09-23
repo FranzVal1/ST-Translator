@@ -6,8 +6,9 @@
   "js": "index.js",
   "css": "style.css",
   "author": "NC AI / OpenAI",
-  "version": "1.2.0",
-  "homePage": "",
+  "version": "1.3.0",
+  "homePage": "https://github.com/FranzVal1/ST-Translator",
+  "generate_interceptor": "safeTranslationInterceptor",
   "hooks": {
     "activate": "init"
   }
