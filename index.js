@@ -54,9 +54,11 @@ const runtime = createRuntime({
         $('#st_safe_stop').prop('disabled', !running);
         $('#st_safe_retry').prop('disabled', running || !failed);
     },
-    async ask() {
-        // No server response or source text is inserted as HTML into the dialog.
-        const choice = await callGenericPopup('Не удалось перевести реплику игрока. Генерация ожидает решения. «Отправить оригинал» разрешает использовать исходный текст только в этой генерации.', POPUP_TYPE.CONFIRM, '', {
+    async ask(error) {
+        // Use textContent: exception messages must never become HTML.
+        const content = document.createElement('div');
+        content.textContent = `Не удалось перевести реплику игрока. Причина: ${String(error?.message ?? error).slice(0, 240)}. Генерация ожидает решения. «Отправить оригинал» разрешает использовать исходный текст только в этой генерации.`;
+        const choice = await callGenericPopup(content, POPUP_TYPE.CONFIRM, '', {
             okButton:'Повторить', cancelButton:'Отмена', defaultResult:0,
             customButtons:[{text:'Отправить оригинал', result:1001}],
         });

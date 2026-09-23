@@ -13,15 +13,17 @@ test('extension UI enables outgoing interceptor and preserves editor original', 
     globalThis.toastr = {error:message=>errors.push(message), warning:()=>{}, info:()=>{}, clear:()=>{}};
     const events = new Map();
     const settings = {};
+    const popupContents = [];
+    let failTranslation = false;
     const context = {chatId:'chat', chat:[{mes:'Привет', is_user:true, extra:{}}], saveChat:async()=>{}};
     globalThis.__st = {
         eventSource:{on:(name, fn)=>events.set(name, fn), off:()=>{}},
         event_types:Object.fromEntries(['CHARACTER_MESSAGE_RENDERED','MESSAGE_SWIPED','CHAT_CHANGED','MESSAGE_UPDATED','MESSAGE_SENT','GENERATION_STOPPED'].map(x=>[x,x])),
         getRequestHeaders:()=>({'Content-Type':'application/json'}), saveSettingsDebounced:()=>{}, updateMessageBlock:()=>{},
         extension_settings:settings, getContext:()=>context,
-        POPUP_TYPE:{CONFIRM:1}, callGenericPopup:async()=>0,
+        POPUP_TYPE:{CONFIRM:1}, callGenericPopup:async content=>{popupContents.push(content); return 0;},
     };
-    globalThis.fetch = async (_, args) => new Response(JSON.parse(args.body).text.replace('Привет', 'Hello'));
+    globalThis.fetch = async (_, args) => failTranslation ? new Response('bad request', {status:400}) : new Response(JSON.parse(args.body).text.replace('Привет', 'Hello'));
     const moduleStub = 'data:text/javascript,' + encodeURIComponent('export const {eventSource,event_types,getRequestHeaders,saveSettingsDebounced,updateMessageBlock,extension_settings,getContext,POPUP_TYPE,callGenericPopup}=globalThis.__st;');
     let code = await readFile(new URL('../index.js', import.meta.url), 'utf8');
     code = code.replace(/from ['"]([^'"]+)['"]/g, (_, path) => `from ${JSON.stringify(path.startsWith('./') ? new URL('../' + path.slice(2), import.meta.url).href : moduleStub)}`);
@@ -56,5 +58,12 @@ test('extension UI enables outgoing interceptor and preserves editor original', 
     document.querySelector('.mes').append(textarea);
     await new Promise(resolve=>setTimeout(resolve, 0));
     assert.equal(textarea.value, 'Привет');
+    failTranslation = true;
+    context.chat[0].mes = 'Новая тестовая реплика';
+    let aborted = false;
+    await globalThis.safeTranslationInterceptor(context.chat.map(m=>({...m})),4096,()=>{aborted=true;},'normal');
+    assert.equal(aborted,true);
+    const popup = popupContents.at(-1);
+    assert.match(typeof popup === 'string' ? popup : popup.textContent, /google: HTTP 400/);
     dom.window.close();
 });
