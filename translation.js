@@ -23,7 +23,8 @@ export async function translateSafely(source, options, request, signal, limit = 
     for (const kind of ['text', 'attribute']) {
         const units = plan.units.filter(u => u.kind === kind);
         let nonce;
-        do { nonce = crypto.randomUUID().replaceAll('-', '').slice(0, 12); } while (source.includes(nonce));
+        // getRandomValues is available on HTTP LAN origins; randomUUID is not.
+        do { nonce = Array.from(crypto.getRandomValues(new Uint8Array(6)), byte => byte.toString(16).padStart(2, '0')).join(''); } while (source.includes(nonce));
         const marker = i => `[[ST_${nonce}_${i}]]`;
         const single = async unit => {
             let result = '';

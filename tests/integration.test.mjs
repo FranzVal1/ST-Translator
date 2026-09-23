@@ -9,18 +9,21 @@ test('extension UI enables outgoing interceptor and preserves editor original', 
     const $ = jquery(dom.window);
     for (const key of ['document', 'Element', 'HTMLElement', 'HTMLTextAreaElement', 'HTMLInputElement', 'MutationObserver', 'Event', 'InputEvent']) globalThis[key] = dom.window[key];
     globalThis.$ = $;
-    globalThis.toastr = {error:()=>{}, warning:()=>{}, info:()=>{}, clear:()=>{}};
+    const errors = [];
+    globalThis.toastr = {error:message=>errors.push(message), warning:()=>{}, info:()=>{}, clear:()=>{}};
     const events = new Map();
     const settings = {};
+    const popupContents = [];
+    let failTranslation = false;
     const context = {chatId:'chat', chat:[{mes:'Привет', is_user:true, extra:{}}], saveChat:async()=>{}};
     globalThis.__st = {
         eventSource:{on:(name, fn)=>events.set(name, fn), off:()=>{}},
         event_types:Object.fromEntries(['CHARACTER_MESSAGE_RENDERED','MESSAGE_SWIPED','CHAT_CHANGED','MESSAGE_UPDATED','MESSAGE_SENT','GENERATION_STOPPED'].map(x=>[x,x])),
         getRequestHeaders:()=>({'Content-Type':'application/json'}), saveSettingsDebounced:()=>{}, updateMessageBlock:()=>{},
         extension_settings:settings, getContext:()=>context,
-        POPUP_TYPE:{CONFIRM:1}, callGenericPopup:async()=>0,
+        POPUP_TYPE:{CONFIRM:1}, callGenericPopup:async content=>{popupContents.push(content); return 0;},
     };
-    globalThis.fetch = async (_, args) => new Response(JSON.parse(args.body).text.replace('Привет', 'Hello'));
+    globalThis.fetch = async (_, args) => failTranslation ? new Response('bad request', {status:400}) : new Response(JSON.parse(args.body).text.replace('Привет', 'Hello'));
     const moduleStub = 'data:text/javascript,' + encodeURIComponent('export const {eventSource,event_types,getRequestHeaders,saveSettingsDebounced,updateMessageBlock,extension_settings,getContext,POPUP_TYPE,callGenericPopup}=globalThis.__st;');
     let code = await readFile(new URL('../index.js', import.meta.url), 'utf8');
     code = code.replace(/from ['"]([^'"]+)['"]/g, (_, path) => `from ${JSON.stringify(path.startsWith('./') ? new URL('../' + path.slice(2), import.meta.url).href : moduleStub)}`);
@@ -35,10 +38,32 @@ test('extension UI enables outgoing interceptor and preserves editor original', 
     assert.equal(prompt[0].mes, 'Hello');
     assert.equal(context.chat[0].mes, 'Привет');
     assert.ok(document.querySelector('.safe_translate_button'));
+    // The host also has direct document click handlers. jQuery reuses the same
+    // event object and changes currentTarget after delegated dispatch.
+    $(document).on('click.hostTest', () => {});
+    const button = document.querySelector('.safe_translate_button');
+    const icon = document.createElement('span'); button.append(icon);
+    const click = new dom.window.MouseEvent('click', {bubbles:true, cancelable:true});
+    icon.dispatchEvent(click);
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.deepEqual(errors, [], 'delegated click must not report a translation error');
+    assert.equal(click.defaultPrevented, true);
+    assert.equal(context.chat[0].extra.display_text, 'Hello');
+    button.dispatchEvent(new dom.window.MouseEvent('click', {bubbles:true, cancelable:true}));
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.equal(context.chat[0].extra.display_text, undefined);
+
     document.querySelector('.mes_edit').dispatchEvent(new dom.window.MouseEvent('click', {bubbles:true}));
     const textarea = document.createElement('textarea'); textarea.className='edit_textarea'; textarea.value='Hello';
     document.querySelector('.mes').append(textarea);
     await new Promise(resolve=>setTimeout(resolve, 0));
     assert.equal(textarea.value, 'Привет');
+    failTranslation = true;
+    context.chat[0].mes = 'Новая тестовая реплика';
+    let aborted = false;
+    await globalThis.safeTranslationInterceptor(context.chat.map(m=>({...m})),4096,()=>{aborted=true;},'normal');
+    assert.equal(aborted,true);
+    const popup = popupContents.at(-1);
+    assert.match(typeof popup === 'string' ? popup : popup.textContent, /google: HTTP 400/);
     dom.window.close();
 });

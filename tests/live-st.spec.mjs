@@ -62,3 +62,42 @@ test('real incoming translation preserves hidden text and translates visible att
     expect(JSON.stringify(requests)).not.toContain('HIDDEN_SECRET');
     console.log(JSON.stringify({test:'real incoming attributes',...result,requests},null,2));
 });
+
+test('manual message button translates and toggles through native host click handlers', async ({page}) => {
+    let requests=0;
+    await page.route('**/api/translate/google', async route=>{
+        requests++;
+        await route.fulfill({status:200,contentType:'text/plain',body:'Проверка кнопки'});
+    });
+    await page.goto(process.env.ST_URL ?? 'http://127.0.0.1:18765/');
+    await page.waitForFunction(()=>document.querySelector('#st_safe_auto'));
+    const id=await page.evaluate(async()=>{
+        const {getContext,extension_settings}=await import('/scripts/extensions.js');
+        extension_settings.translate.auto_mode='none';
+        Object.assign(extension_settings.safe_translation,{enabled:true,autoIncoming:false,provider:'google',targetLanguage:'ru'});
+        globalThis.__clickErrors=[];
+        toastr.error=message=>globalThis.__clickErrors.push(String(message));
+        const ctx=getContext();
+        const message={name:'Test',mes:'Button test',is_user:false,is_system:false,extra:{},send_date:Date.now()};
+        ctx.chat.push(message);ctx.addOneMessage(message);
+        return ctx.chat.length-1;
+    });
+    const button=page.locator(`#chat .mes[mesid="${id}"] .safe_translate_button`);
+    await button.waitFor({state:'attached'});
+    await button.dispatchEvent('click');
+    await expect.poll(async()=>page.evaluate(async id=>{
+        const {getContext}=await import('/scripts/extensions.js');
+        return {display:getContext().chat[id].extra.display_text,errors:globalThis.__clickErrors};
+    },id)).toEqual({display:'Проверка кнопки',errors:[]});
+    await button.dispatchEvent('click');
+    await expect.poll(()=>page.evaluate(async id=>{
+        const {getContext}=await import('/scripts/extensions.js');
+        return getContext().chat[id].extra.display_text ?? null;
+    },id)).toBe(null);
+    await button.dispatchEvent('click');
+    await expect.poll(()=>page.evaluate(async id=>{
+        const {getContext}=await import('/scripts/extensions.js');
+        return getContext().chat[id].extra.display_text;
+    },id)).toBe('Проверка кнопки');
+    expect(requests).toBe(1);
+});

@@ -42,3 +42,15 @@ test('outgoing serialization separates literal prompt text from safe display HTM
     const result = await translateSafely('Hello &amp; {{user}}', {...options, outputMode:'both'}, async()=> 'Tom & Jerry < 5', new AbortController().signal, 1000);
     assert.deepEqual(result, {prompt:'Tom & Jerry < 5 &amp; {{user}}', display:'Tom &amp; Jerry &lt; 5 &amp; {{user}}'});
 });
+
+test('HTTP/LAN translation works without secure-context crypto.randomUUID', async()=>{
+    const descriptor=Object.getOwnPropertyDescriptor(globalThis.crypto,'randomUUID');
+    Object.defineProperty(globalThis.crypto,'randomUUID',{value:undefined,configurable:true});
+    try {
+        const result=await translateSafely('<b>Hello</b> <i>world</i>',options,async text=>text.replace('Hello','Привет').replace('world','мир'),new AbortController().signal,1000);
+        assert.equal(result,'<b>Привет</b> <i>мир</i>');
+    } finally {
+        if(descriptor) Object.defineProperty(globalThis.crypto,'randomUUID',descriptor);
+        else delete globalThis.crypto.randomUUID;
+    }
+});
